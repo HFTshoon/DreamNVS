@@ -10,6 +10,7 @@ import argparse
 from diffusers import DDIMScheduler, AutoencoderKL
 from utils.attn_utils import register_attention_editor_diffusers, MutualSelfAttentionControl
 from utils.predict import predict_z0, splat_flowmax
+from utils.predict_3d import predict_3d
 from diffusers.utils.import_utils import is_xformers_available
 
 def main(args):
@@ -42,6 +43,9 @@ def main(args):
     else:
         print("applying lora: " + args.lora_path)
         model.unet.load_attn_procs(args.lora_path,weight_name=weight_name)
+
+    # perform dust3r/mast3r and get pointmaps
+    result = predict_3d(args.img_path)
 
     # predict high-level space z_T\to0
     flow1to2,flow2to1=predict_z0(model,args,sup_res_h,sup_res_w)

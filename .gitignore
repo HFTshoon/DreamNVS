@@ -1,4 +1,7 @@
 lora_tmp/
-results/
+lora-dreambooth-model/
+results*/
+*.pth
+
 __pycache__/
 *.pyc
