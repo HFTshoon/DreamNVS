@@ -19,7 +19,7 @@ class PointCloudOptimizer(BasePCOptimizer):
     Graph edges: observations = (pred1, pred2)
     """
 
-    def __init__(self, *args, optimize_pp=False, focal_break=20, **kwargs):
+    def __init__(self, *args, optimize_pp=True, focal_break=20, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.has_im_poses = True  # by definition of this class
@@ -80,14 +80,23 @@ class PointCloudOptimizer(BasePCOptimizer):
         self.im_poses.requires_grad_(False)
         self.norm_pw_scale = False
 
+    # def preset_focal(self, known_focals, msk=None):
+    #     self._check_all_imgs_are_selected(msk)
+
+    #     for idx, focal in zip(self._get_msk_indices(msk), known_focals):
+    #         print(f' (setting focal #{idx} = {focal})')
+    #         self._no_grad(self._set_focal(idx, focal))
+
+    #     self.im_focals.requires_grad_(False)
+
     def preset_focal(self, known_focals, msk=None):
         self._check_all_imgs_are_selected(msk)
 
-        for idx, focal in zip(self._get_msk_indices(msk), known_focals):
-            print(f' (setting focal #{idx} = {focal})')
-            self._no_grad(self._set_focal(idx, focal))
+        known_focals_mean = np.mean(known_focals)
+        print(f' (setting focal = {known_focals_mean})')
+        self._no_grad(self._set_focal(known_focals_mean))
 
-        self.im_focals.requires_grad_(False)
+        self.im_focal.requires_grad_(False)
 
     def preset_principal_point(self, known_pp, msk=None):
         self._check_all_imgs_are_selected(msk)
@@ -96,6 +105,9 @@ class PointCloudOptimizer(BasePCOptimizer):
             print(f' (setting principal point #{idx} = {pp})')
             self._no_grad(self._set_principal_point(idx, pp))
 
+        self.im_pp.requires_grad_(False)
+
+    def preset_principal_point_zero(self):
         self.im_pp.requires_grad_(False)
 
     def _get_msk_indices(self, msk):
