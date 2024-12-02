@@ -26,6 +26,13 @@ def rotmat2qvec(R):
         qvec *= -1
     return qvec
 
+def traj2vec(traj):
+    vec = np.zeros((traj.shape[0], 7))
+    for i in range(traj.shape[0]):
+        vec[i, :4] = rotmat2qvec(traj[i, :3, :3])
+        vec[i, 4:] = traj[i, :3, 3]
+    return vec
+
 def fov2focal(fov, pixels):
     return pixels / (2 * math.tan(fov / 2))
 
