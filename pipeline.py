@@ -75,7 +75,6 @@ def override_forward(self):
         t_emb = t_emb.to(dtype=self.dtype)
 
         emb = self.time_embedding(t_emb, timestep_cond)
-        breakpoint()
 
         if self.class_embedding is not None:
             if class_labels is None:
@@ -436,7 +435,7 @@ class MovePipeline(StableDiffusionPipeline):
             # YUJUN: right now, the only difference between step here and step in scheduler
             # is that scheduler version would clamp pred_x0 between [-1,1]
             # # don't know if that's gonna have huge impact
-            
+
             # added_cond_kwargs = {
             #     "guidance_3d": guidance_3d,
             #     "guidance_traj": guidance_traj

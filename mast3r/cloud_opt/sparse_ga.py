@@ -526,7 +526,6 @@ def forward_mast3r(pairs, model, cache_path, desc_conf='desc_conf',
     res_paths = {}
 
     for img1, img2 in tqdm(pairs):
-        breakpoint()
         idx1 = hash_md5(img1['instance'])
         idx2 = hash_md5(img2['instance'])
 
