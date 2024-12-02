@@ -11,6 +11,7 @@ from diffusers import DDIMScheduler, AutoencoderKL
 from utils.attn_utils import register_attention_editor_diffusers, MutualSelfAttentionControl
 from utils.predict import predict_z0, splat_flowmax
 from utils.predict_3d import predict_3d
+from utils.condition_encoder import load_guidance_model
 from diffusers.utils.import_utils import is_xformers_available
 
 def main(args):
@@ -44,19 +45,32 @@ def main(args):
         print("applying lora: " + args.lora_path)
         model.unet.load_attn_procs(args.lora_path,weight_name=weight_name)
 
+    # set guidance model
+    model.guidance_model = load_guidance_model(args.guidance_path).to(device)
+
     # perform dust3r/mast3r and get pointmaps
-    result = predict_3d(args.img_path)
+    guidance_3d, guidance_traj, focals, poses, pts3d = predict_3d(model, args)
 
     # predict high-level space z_T\to0
-    flow1to2,flow2to1=predict_z0(model,args,sup_res_h,sup_res_w)
+    flow1to2,flow2to1=predict_z0(model,args,sup_res_h,sup_res_w,guidance_3d, guidance_traj)
         
     with torch.no_grad():
         invert_code, pred_x0_list = model.invert(args.source_image,
                                 args.prompt,
+                                # guidance_3d,
+                                # guidance_traj,
                                 guidance_scale=args.guidance_scale,
                                 num_inference_steps=args.n_inference_step,
                                 num_actual_inference_steps=args.n_actual_inference_step,
                                 return_intermediates=True)
+        # invert_code, pred_x0_list = model.invert_nvs(args.source_image,
+        #                         args.prompt,
+        #                         guidance_3d,
+        #                         guidance_traj,
+        #                         guidance_scale=[args.guidance_scale, args.guidance_scale_3d, args.guidance_scale_traj],
+        #                         num_inference_steps=args.n_inference_step,
+        #                         num_actual_inference_steps=args.n_actual_inference_step,
+        #                         return_intermediates=True)
         init_code = deepcopy(invert_code)
         pred_code = deepcopy(pred_x0_list[args.n_actual_inference_step])
         
@@ -67,6 +81,7 @@ def main(args):
                                         start_layer=10,
                                         total_steps=args.n_inference_step,
                                         guidance_scale=args.guidance_scale)
+                                        # guidance_scale=[args.guidance_scale, args.guidance_scale_3d, args.guidance_scale_traj])
         if args.lora_path == "":
             register_attention_editor_diffusers(model, editor, attn_processor='attn_proc')
         else:
@@ -95,10 +110,13 @@ def main(args):
 
         gen_image = model(
             prompt=args.prompt,
+            # guidance_3d=guidance_3d,
+            # guidance_traj=guidance_traj,
             batch_size=input_latents.shape[0],
             latents=input_latents,
             pred_x0=input_pred,
             guidance_scale=args.guidance_scale,
+            # guidance_scale=[args.guidance_scale, args.guidance_scale_3d, args.guidance_scale_traj],
             num_inference_steps=args.n_inference_step,
             num_actual_inference_steps=args.n_actual_inference_step,
             save_dir=args.save_dir
@@ -119,8 +137,11 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', type=str, help='diffusion model directory', required=False, default="runwayml/stable-diffusion-v1-5")
     parser.add_argument('--vae_path', type=str, help='vae model directory', default='default')
     parser.add_argument('--lora_path', type=str, help='lora model directory', required=True)
+    parser.add_argument('--guidance_path', type=str, help='guidance model directory', required=True)
     parser.add_argument('--save_dir', type=str, help='save results directory', required=False, default="./results")
-    parser.add_argument('--guidance_scale', type=float, help='CFG', default=1.0)
+    parser.add_argument('--guidance_scale', type=float, help='CFG', default=2.0)
+    parser.add_argument('--guidance_scale_3d', type=float, help='CFG', default=2.0)
+    parser.add_argument('--guidance_scale_traj', type=float, help='CFG', default=2.0)
     parser.add_argument('--n_inference_step', type=int, help='total noisy timestamp', default=50)
     parser.add_argument('--feature_inversion', type=int, help='DDIM Inversion steps for feature maps', default=14)
     parser.add_argument('--n_actual_inference_step', type=int, help='DDIM Inversion steps for inference', default=30)
@@ -137,6 +158,15 @@ if __name__ == '__main__':
         img.append(imageio.imread(img_path))
     image = np.stack((img[0],img[1]))
     source_image =  torch.from_numpy(image).float() / 127.5 - 1
+
+    # if image is rgba, remove alpha channel (4 -> 3)
+    if source_image.shape[3] == 4:
+        source_image = source_image[:,:,:,:3]
+
+    # resize to (2, 512, 512, 3)
+    source_image = torch.nn.functional.interpolate(source_image.permute(0,3,1,2), size=(512, 512), mode='bilinear', align_corners=False)
+    source_image = source_image.permute(0,2,3,1)
+
     args.source_image = source_image.permute(0,3,1,2)
     
     gen_image = main(args)

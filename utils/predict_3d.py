@@ -1,81 +1,195 @@
 import os
-import tempfile
+import json
 
-from mast3r.model import AsymmetricMASt3R
-from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
+import torch
+import numpy as np
+import open3d as o3d
 
-from dust3r.utils.image import load_images
-from dust3r.utils.device import to_numpy
-from dust3r.image_pairs import make_pairs
+from traj_enc.util_traj import traj2vec
+from utils.recon_3d import recon_3d_mast3r, recon_3d_dust3r
+from utils.make_trajectory import generate_smooth_camera_path
 
-def predict_3d(img_dir):
-    model_path = 'checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth'
-    device = 'cuda'
-    batch_size = 1
-    schedule = 'cosine'
-    lr = 0.01
-    niter = 300
+def sample_and_pad_3d(data, size=4096):
+    if len(data) > size:
+        indices = np.random.choice(len(data), size, replace=False)
+        data = data[indices]
+    elif len(data) < size:
+        pad_size = size - len(data)
+        pad_indices = np.random.choice(len(data), pad_size, replace=True)
+        data = np.concatenate([data, data[pad_indices]], axis=0)
+        indices = np.concatenate([np.arange(len(data)), pad_indices], axis=0)
+    return data, indices
 
-    # you can put the path to a local checkpoint in model_name if needed
-    model = AsymmetricMASt3R.from_pretrained(model_path).to(device)
+def sample_and_pad_trajectory(data, size=100):
+    if len(data) > size:
+        indices = np.random.choice(len(data)-1, size-2, replace=False) + 1
+        data = np.concatenate([data[0:1], data[indices], data[-1:]], axis=0)
+    elif len(data) < size:
+        pad_value = data[-1]
+        pad_size = size - len(data)
+        data = np.concatenate([data, np.repeat(pad_value.reshape(1,-1), pad_size, axis=0)], axis=0)
+        indices = np.concatenate([np.arange(len(data)), np.full(pad_size, len(data)-1)], axis=0)
+    return data, indices
+
+def get_extrinsics_intrinsics(img_dir):
+    extrinsics = None
+    intrinsics = None
+
+    extrinsics_path = os.path.join(img_dir, 'extrinsics.json')
+    intrinsics_path = os.path.join(img_dir, 'intrinsics.json')
     
-    img_path_list = [os.path.join(img_dir,'0.png'),os.path.join(img_dir,'1.png')]
-    images = load_images(img_path_list, size=512)
-    pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
-    cache_dir = tempfile.mkdtemp()
-    os.makedirs(cache_dir, exist_ok=True)
-    scene = sparse_global_alignment(images, pairs, cache_dir, model, device=device)
+    if os.path.exists(extrinsics_path):
+        with open(extrinsics_path, 'r') as f:
+            data_extrinsics = json.load(f)
 
-    imgs = scene.imgs
-    focals = scene.get_focals()
-    poses = scene.get_im_poses()
-    pts3d, depths, confidences = scene.get_dense_pts3d()
+        extrinsics = torch.tensor(data_extrinsics['extrinsics']).float() # (2, 4, 4)
+
+    if os.path.exists(intrinsics_path):
+        with open(intrinsics_path, 'r') as f:
+            data_intrinsics = json.load(f)
+
+        intrinsics = {
+            "focals": data_intrinsics['focals'], # len 2 list
+            "principal_points": torch.tensor(data_intrinsics['principal_points']).float() # (2, 2)
+        }    
+
+    return extrinsics, intrinsics
+
+def get_trajectory(img_dir, poses, length = 100):
+    trajectory_path = os.path.join(img_dir, 'trajectory.json')
+
+    if os.path.exists(trajectory_path):
+        with open(trajectory_path, 'r') as f:
+            data_trajectory = json.load(f)
+
+        trajectory = np.array(data_trajectory['trajectory']) # (N, 7)
+    else:
+        first_pose = poses[0].detach().cpu().numpy()
+        last_pose = poses[-1].detach().cpu().numpy()
+        positions, rotations = generate_smooth_camera_path(first_pose[:3,:3], first_pose[:3,3], last_pose[:3,:3], last_pose[:3,3], length)
+        trajectory = []
+        for i in range(len(positions)):
+            R = np.array(rotations[i])
+            T = np.array(positions[i]).reshape(-1,1)
+            matrix = np.concatenate((np.concatenate((R, T), axis=1), np.array([[0,0,0,1]])), axis=0)
+            trajectory.append(matrix)
+        trajectory = np.array(trajectory)
+
+    return trajectory
+
+def predict_3d(model, args, use_mast3r=True):
+    extrinsics, intrinsics = get_extrinsics_intrinsics(args.img_path)
+
+    if use_mast3r:
+        imgs, focals, poses, pps, pts3d, confidence_masks, matches_im0, matches_im1 = recon_3d_mast3r(args.img_path, extrinsics, intrinsics)
+    else:
+        imgs, focals, poses, pps, pts3d, confidence_masks, matches_im0, matches_im1 = recon_3d_mast3r(args.img_path, extrinsics, intrinsics)
+
+    trajectory = traj2vec(get_trajectory(args.img_path, poses))
+    trajectory = torch.from_numpy(trajectory).float()
+
+    # tensor to numpy
+    confidence_mask0 = confidence_masks[0].detach().cpu().numpy()
+    confidence_mask1 = confidence_masks[1].detach().cpu().numpy()
+
+    match_mask0 = np.zeros((confidence_mask0.shape[0], confidence_mask0.shape[1]))
+    match_mask1 = np.zeros((confidence_mask1.shape[0], confidence_mask1.shape[1]))
+    for i in range(matches_im0.shape[0]):
+        match_mask0[matches_im0[i,1]][matches_im0[i,0]] = 1
+    for i in range(matches_im1.shape[0]):
+        match_mask1[matches_im1[i,1]][matches_im1[i,0]] = 1
+    match_mask0 = match_mask0.astype(bool)
+    match_mask1 = match_mask1.astype(bool)
+
+    match_conf_mask0 = confidence_mask0 * match_mask0
+    match_conf_mask1 = confidence_mask1 * match_mask1
+
+    print(f"Confidence points: {np.sum(confidence_mask0) + np.sum(confidence_mask1)}")
+    print(f"Matched points: {np.sum(match_mask0) + np.sum(match_mask1)}")
+    print(f"Matched confidence points: {np.sum(match_conf_mask0) + np.sum(match_conf_mask1)}")
+
+    # change (H,W,3) to (N,3)
+    pts3d1 = pts3d[0].detach().cpu().numpy()[confidence_mask0]
+    pts3d2 = pts3d[1].detach().cpu().numpy()[confidence_mask1]
+    pts3d1_color = imgs[0][confidence_mask0]
+    pts3d2_color = imgs[1][confidence_mask1]
+
+    pts3d1 = pts3d1.reshape(-1,3)
+    pts3d2 = pts3d2.reshape(-1,3)
+    pts3d1_color = pts3d1_color.reshape(-1,3)
+    pts3d2_color = pts3d2_color.reshape(-1,3)
+
+    pts3d1_sample, indices1 = sample_and_pad_3d(pts3d1, size=2048)
+    pts3d2_sample, indices2 = sample_and_pad_3d(pts3d2, size=2048)
+    pts3d1_color_sample = pts3d1_color[indices1]
+    pts3d2_color_sample = pts3d2_color[indices2]
+
+    pts3d_sample = np.concatenate([pts3d1_sample, pts3d2_sample], axis=0)
+    pts3d_color_sample = np.concatenate([pts3d1_color_sample, pts3d2_color_sample], axis=0)
+
+    guidance_3d, guidance_traj = model.guidance_model(pts3d_sample, trajectory)
+    print(f"Guidance 3D: {guidance_3d.shape}, Guidance Trajectory: {guidance_traj.shape}")
+
+    return guidance_3d, guidance_traj, focals, poses, pts3d
+
+    pts3d1 = pts3d[0].detach().cpu().numpy()[confidence_mask0]
+    pts3d2 = pts3d[1].detach().cpu().numpy()[confidence_mask1]
+    pts3d1_color = imgs[0][confidence_mask0]
+    pts3d2_color = imgs[1][confidence_mask1]
+
+    # pts3d1_match = pts3d[0].detach().cpu().numpy()[match_mask0]
+    # pts3d2_match = pts3d[1].detach().cpu().numpy()[match_mask1]
+    # pts3d1_match_color = imgs[0][match_mask0]
+    # pts3d2_match_color = imgs[1][match_mask1]
+
+    # pts3d1_match_conf = pts3d[0].detach().cpu().numpy()[match_conf_mask0]
+    # pts3d2_match_conf = pts3d[1].detach().cpu().numpy()[match_conf_mask1]
+    # pts3d1_match_conf_color = imgs[0][match_conf_mask0]
+    # pts3d2_match_conf_color = imgs[1][match_conf_mask1]
+
+    # pts3d1_match = pts3d1_match.reshape(-1,3)
+    # pts3d2_match = pts3d2_match.reshape(-1,3)
+    # pts3d1_match_color = pts3d1_match_color.reshape(-1,3)
+    # pts3d2_match_color = pts3d2_match_color.reshape(-1,3)
+
+    # pts3d1_match_conf = pts3d1_match_conf.reshape(-1,3)
+    # pts3d2_match_conf = pts3d2_match_conf.reshape(-1,3)
+    # pts3d1_match_conf_color = pts3d1_match_conf_color.reshape(-1,3)
+    # pts3d2_match_conf_color = pts3d2_match_conf_color.reshape(-1,3)
+
+    pcd1 = o3d.geometry.PointCloud()
+    pcd2 = o3d.geometry.PointCloud()
+    pcd1.points = o3d.utility.Vector3dVector(pts3d1)
+    pcd2.points = o3d.utility.Vector3dVector(pts3d2)
+    pcd1.colors = o3d.utility.Vector3dVector(pts3d1_color)
+    pcd2.colors = o3d.utility.Vector3dVector(pts3d2_color)
+
+    pcd1_sample = o3d.geometry.PointCloud()
+    pcd2_sample = o3d.geometry.PointCloud()
+    pcd1_sample.points = o3d.utility.Vector3dVector(pts3d1_sample)
+    pcd2_sample.points = o3d.utility.Vector3dVector(pts3d2_sample)
+    pcd1_sample.colors = o3d.utility.Vector3dVector(pts3d1_color_sample)
+    pcd2_sample.colors = o3d.utility.Vector3dVector(pts3d2_color_sample)
+
+    # pcd1_match = o3d.geometry.PointCloud()
+    # pcd2_match = o3d.geometry.PointCloud()
+    # pcd1_match.points = o3d.utility.Vector3dVector(pts3d1_match)
+    # pcd2_match.points = o3d.utility.Vector3dVector(pts3d2_match)
+    # pcd1_match.colors = o3d.utility.Vector3dVector(pts3d1_match_color)
+    # pcd2_match.colors = o3d.utility.Vector3dVector(pts3d2_match_color)
+
+    # pcd1_match_conf = o3d.geometry.PointCloud()
+    # pcd2_match_conf = o3d.geometry.PointCloud()
+    # pcd1_match_conf.points = o3d.utility.Vector3dVector(pts3d1_match_conf)
+    # pcd2_match_conf.points = o3d.utility.Vector3dVector(pts3d2_match_conf)
+    # pcd1_match_conf.colors = o3d.utility.Vector3dVector(pts3d1_match_conf_color)
+    # pcd2_match_conf.colors = o3d.utility.Vector3dVector(pts3d2_match_conf_color)
+
+    # o3d.visualization.draw_geometries([pcd1, pcd2])
+    # o3d.visualization.draw_geometries([pcd1_sample, pcd2_sample])
+    # o3d.visualization.draw_geometries([pcd1_match, pcd2_match])
+    # o3d.visualization.draw_geometries([pcd1_match_conf, pcd2_match_conf])
 
     breakpoint()
 
-    # # at this stage, you have the raw dust3r predictions
-    # view1, pred1 = output['view1'], output['pred1']
-    # view2, pred2 = output['view2'], output['pred2']
-
-    # desc1, desc2 = pred1['desc'].squeeze(0).detach(), pred2['desc'].squeeze(0).detach()
-
-    # # find 2D-2D matches between the two images
-    # matches_im0, matches_im1 = fast_reciprocal_NNs(desc1, desc2, subsample_or_initxy1=8,
-    #                                                device=device, dist='dot', block_size=2**13)
-
-    # # ignore small border around the edge
-    # H0, W0 = view1['true_shape'][0]
-    # valid_matches_im0 = (matches_im0[:, 0] >= 3) & (matches_im0[:, 0] < int(W0) - 3) & (
-    #     matches_im0[:, 1] >= 3) & (matches_im0[:, 1] < int(H0) - 3)
-
-    # H1, W1 = view2['true_shape'][0]
-    # valid_matches_im1 = (matches_im1[:, 0] >= 3) & (matches_im1[:, 0] < int(W1) - 3) & (
-    #     matches_im1[:, 1] >= 3) & (matches_im1[:, 1] < int(H1) - 3)
-
-    # valid_matches = valid_matches_im0 & valid_matches_im1
-    # matches_im0, matches_im1 = matches_im0[valid_matches], matches_im1[valid_matches]
-
-    # scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PointCloudOptimizer)
-    # loss = scene.compute_global_alignment(init="mst", niter=300, schedule="cosine", lr=0.01)
-    # scene.min_conf_thr = 1.5
-
-    # # retrieve useful values from scene:
-    # imgs = scene.imgs
-    # focals = scene.get_focals()
-    # poses = scene.get_im_poses()
-    # pts3d = scene.get_pts3d()
-    # confidence_masks = scene.get_masks()
-
-    # breakpoint()
-
-    # # visualize reconstruction
-    # scene.show()
-
-    # breakpoint()
-    # pts3d_im0 = pred1['pts3d'].squeeze(0).detach().cpu().numpy()
-    # pts3d_im1 = pred2['pts3d'].squeeze(0).detach().cpu().numpy()
-    # conf_im0 = pred1['conf'].squeeze(0).detach().cpu().numpy()
-    # conf_im1 = pred2['conf'].squeeze(0).detach().cpu().numpy()
-    # desc_conf_im0 = pred1['desc_conf'].squeeze(0).detach().cpu().numpy()
-    # desc_conf_im1 = pred2['desc_conf'].squeeze(0).detach().cpu().numpy()
-    return 
+    return None

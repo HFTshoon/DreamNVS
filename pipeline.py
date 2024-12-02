@@ -17,6 +17,7 @@ def override_forward(self):
         sample: torch.FloatTensor,
         timestep: Union[torch.Tensor, float, int],
         encoder_hidden_states: torch.Tensor,
+        added_cond_kwargs: Optional[Dict[str, Any]] = None,
         class_labels: Optional[torch.Tensor] = None,
         timestep_cond: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -74,6 +75,7 @@ def override_forward(self):
         t_emb = t_emb.to(dtype=self.dtype)
 
         emb = self.time_embedding(t_emb, timestep_cond)
+        breakpoint()
 
         if self.class_embedding is not None:
             if class_labels is None:
@@ -318,11 +320,26 @@ class MovePipeline(StableDiffusionPipeline):
 
     # get all intermediate features and then do bilinear interpolation
     # return features in the layer_idx list
-    def forward_unet_features(self, z, t, encoder_hidden_states, layer_idx=[0]):
+    def forward_unet_features(
+            self, 
+            z, 
+            t, 
+            encoder_hidden_states, 
+            # guidance_3d,
+            # guidance_traj,
+            layer_idx=[0]
+        ):
+        
+        # added_cond_kwargs = {
+        #     "guidance_3d": guidance_3d,
+        #     "guidance_traj": guidance_traj
+        # }
+        
         unet_output, all_intermediate_features = self.unet(
             z,
             t,
             encoder_hidden_states=encoder_hidden_states,
+            # added_cond_kwargs=added_cond_kwargs,
             return_intermediates=True
             )
 
@@ -338,6 +355,8 @@ class MovePipeline(StableDiffusionPipeline):
         self,
         prompt,
         prompt_embeds=None, # whether text embedding is directly provided.
+        # guidance_3d=None,
+        # guidance_traj=None,
         batch_size=1,
         height=512,
         width=512,
@@ -416,15 +435,36 @@ class MovePipeline(StableDiffusionPipeline):
             # compute the previous noise sample x_t -> x_t-1
             # YUJUN: right now, the only difference between step here and step in scheduler
             # is that scheduler version would clamp pred_x0 between [-1,1]
-            # don't know if that's gonna have huge impact
+            # # don't know if that's gonna have huge impact
+            
+            # added_cond_kwargs = {
+            #     "guidance_3d": guidance_3d,
+            #     "guidance_traj": guidance_traj
+            # }
+
             if i == num_inference_steps-num_actual_inference_steps and pred_x0 != None:
-                noise_pred = self.unet(model_inputs, t, encoder_hidden_states=text_embeddings)
+                noise_pred = self.unet(
+                    model_inputs, 
+                    t, 
+                    encoder_hidden_states=text_embeddings,
+                    # added_cond_kwargs=added_cond_kwargs
+                    )
                 inter_xt = self.get_interxt(noise_pred[1:-1], t, pred_x0[1:-1])
                 latents[1:-1] = inter_xt
-                noise_pred = self.unet(latents, t, encoder_hidden_states=text_embeddings)
+                noise_pred = self.unet(
+                    latents, 
+                    t, 
+                    encoder_hidden_states=text_embeddings,
+                    # added_cond_kwargs=added_cond_kwargs
+                    )
                 latents = self.pred_step(noise_pred, t, pred_x0) 
             else:
-                noise_pred = self.unet(model_inputs, t, encoder_hidden_states=text_embeddings)
+                noise_pred = self.unet(
+                    model_inputs, 
+                    t, 
+                    encoder_hidden_states=text_embeddings,
+                    # added_cond_kwargs=added_cond_kwargs
+                    )
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
             if return_intermediates:
@@ -511,6 +551,133 @@ class MovePipeline(StableDiffusionPipeline):
             if guidance_scale > 1.:
                 noise_pred_uncon, noise_pred_con = noise_pred.chunk(2, dim=0)
                 noise_pred = noise_pred_uncon + guidance_scale * (noise_pred_con - noise_pred_uncon)
+            # compute the previous noise sample x_t-1 -> x_t
+            latents, pred_x0 = self.inv_step(noise_pred, t, latents)
+            latents_list.append(latents)
+            pred_x0_list.append(pred_x0)
+
+        if return_intermediates:
+            # return the intermediate laters during inversion
+            # pred_x0_list = [self.latent2image(img, return_type="pt") for img in pred_x0_list]
+            return latents, pred_x0_list
+        return latents
+    
+    @torch.no_grad()
+    def invert_nvs(
+        self,
+        image: torch.Tensor,
+        prompt,
+        guidance_3d,
+        guidance_traj,
+        num_inference_steps=50,
+        num_actual_inference_steps=None,
+        guidance_scale=[7.5,7.5,7.5],
+        eta=0.0,
+        return_intermediates=False,
+        **kwds):
+        """
+        invert a real image into noise map with determinisc DDIM inversion
+        """
+
+        if isinstance(guidance_scale, float):
+            guidance_scale = [guidance_scale, guidance_scale, guidance_scale]
+
+        if guidance_scale[0] > 1. or guidance_scale[1] > 1. or guidance_scale[2] > 1.:
+            perfrom_cfg = True
+        else:
+            perfrom_cfg = False
+
+        DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        batch_size = image.shape[0]
+        if isinstance(prompt, list):
+            if batch_size == 1:
+                image = image.expand(len(prompt), -1, -1, -1)
+        elif isinstance(prompt, str):
+            if batch_size > 1:
+                prompt = [prompt] * batch_size
+
+        if batch_size > 1:
+            guidance_3d = guidance_3d.repeat(batch_size, 1, 1)
+            guidance_traj = guidance_traj.repeat(batch_size, 1, 1)
+
+        # text embeddings
+        text_input = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=77,
+            return_tensors="pt"
+        )
+        text_embeddings = self.text_encoder(text_input.input_ids.to(DEVICE))[0]
+        print("input text embeddings :", text_embeddings.shape)
+        # define initial latents
+        latents = self.image2latent(image)
+
+        # unconditional embedding for classifier free guidance
+        if perfrom_cfg:
+        # if guidance_scale > 1.:
+            max_length = text_input.input_ids.shape[-1]
+            unconditional_input_text = self.tokenizer(
+                [""] * batch_size,
+                padding="max_length",
+                max_length=77,
+                return_tensors="pt"
+            )
+            unconditional_embeddings_text = self.text_encoder(unconditional_input_text.input_ids.to(DEVICE))[0]
+            text_embeddings = torch.cat([unconditional_embeddings_text, text_embeddings, text_embeddings, text_embeddings], dim=0)
+
+            guidance_3d_length = guidance_3d.shape[-2]
+            unconditional_input_3d = np.zeros((guidance_3d_length * 8, 3))
+            unconditional_embeddings_3d = self.guidance_model.compute_3D_guidance(unconditional_input_3d)
+            unconditional_embeddings_3d = unconditional_embeddings_3d.repeat(batch_size, 1, 1)
+            spatial_embeddings = torch.cat([unconditional_embeddings_3d, unconditional_embeddings_3d, guidance_3d, guidance_3d], dim=0)
+
+            guidance_traj_length = guidance_traj.shape[-2]
+            unconditional_input_traj = np.zeros((guidance_traj_length * 2, 7))
+            unconditional_embeddings_traj = self.guidance_model.compute_trajectory_guidance(unconditional_input_traj)
+            unconditional_embeddings_traj = unconditional_embeddings_traj.repeat(batch_size, 1, 1)
+            trajectory_embeddings = torch.cat([unconditional_embeddings_traj, unconditional_embeddings_traj, unconditional_embeddings_traj, guidance_traj], dim=0)
+
+            print("text_embeddings shape: ", text_embeddings.shape)
+            print("spatial_embeddings shape: ", spatial_embeddings.shape)            
+            print("trajectory_embeddings shape: ", trajectory_embeddings.shape)
+
+        added_cond_kwargs = {
+            "guidance_3d": guidance_3d,
+            "guidance_traj": guidance_traj
+        }
+
+        print("latents shape: ", latents.shape)
+        # interative sampling
+        self.scheduler.set_timesteps(num_inference_steps)
+        print("Valid timesteps: ", reversed(self.scheduler.timesteps))
+        # print("attributes: ", self.scheduler.__dict__)
+        latents_list = [latents]
+        pred_x0_list = [latents]
+        for i, t in enumerate(tqdm(reversed(self.scheduler.timesteps), desc="DDIM Inversion")):
+            if num_actual_inference_steps is not None and i >= num_actual_inference_steps:
+                continue
+
+            if perfrom_cfg:
+            # if guidance_scale > 1.:
+                model_inputs = torch.cat([latents] * 4)
+            else:
+                model_inputs = latents
+
+            # predict the noise
+            noise_pred = self.unet(
+                model_inputs, 
+                t, 
+                encoder_hidden_states=text_embeddings,
+                added_cond_kwargs=added_cond_kwargs
+                )
+            if perfrom_cfg:
+            # if guidance_scale > 1.:
+                noise_pred_uncon, noise_pred_con1, noise_pred_con2, noise_pred_con3 = noise_pred.chunk(4, dim=0)
+                noise_pred = noise_pred_uncon \
+                                + guidance_scale[0] * (noise_pred_con1 - noise_pred_uncon) \
+                                + guidance_scale[1] * (noise_pred_con2 - noise_pred_con1) \
+                                + guidance_scale[2] * (noise_pred_con3 - noise_pred_con2)                                
+                
             # compute the previous noise sample x_t-1 -> x_t
             latents, pred_x0 = self.inv_step(noise_pred, t, latents)
             latents_list.append(latents)
