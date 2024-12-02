@@ -501,6 +501,12 @@ class DreamBoothDataset(Dataset):
             raise ValueError("Instance images root doesn't exists.")
 
         self.instance_images_path = list(Path(instance_data_root).iterdir())
+
+        # get only image file end with .jpg, .jpeg, .png
+        for image_path in self.instance_images_path:
+            if image_path.suffix.lower() not in [".jpg", ".jpeg", ".png"]:
+                self.instance_images_path.remove(image_path)
+
         self.num_instance_images = len(self.instance_images_path)
         self.instance_prompt = instance_prompt
         self._length = self.num_instance_images
