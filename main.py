@@ -11,7 +11,8 @@ from diffusers import DDIMScheduler, AutoencoderKL
 from utils.attn_utils import register_attention_editor_diffusers, MutualSelfAttentionControl
 from utils.predict import predict_z0, splat_flowmax
 from utils.predict_3d import predict_3d
-from utils.condition_encoder import load_guidance_model
+# from utils.condition_encoder_legacy import load_guidance_model
+from utils.condition_encoder import load_spatial_guidance_model, load_trajectory_guidance_model
 from diffusers.utils.import_utils import is_xformers_available
 
 def main(args):
@@ -46,31 +47,49 @@ def main(args):
         model.unet.load_attn_procs(args.lora_path,weight_name=weight_name)
 
     # set guidance model
-    model.guidance_model = load_guidance_model(args.guidance_path).to(device)
+    print("loading guidance models")
+    if args.guide_mode == "guide_concat":
+        if not args.spatial_guidance_path.endswith("_768.pth"):
+            args.spatial_guidance_path = args.spatial_guidance_path.replace(".pth", "_768.pth")
+        if not args.trajectory_guidance_path.endswith("_768.pth"):
+            args.trajectory_guidance_path = args.trajectory_guidance_path.replace(".pth", "_768.pth")
+    model.spatial_guidance_model = load_spatial_guidance_model(args.spatial_guidance_path).to(device)
+    model.trajectory_guidance_model = load_trajectory_guidance_model(args.trajectory_guidance_path).to(device)
+    model.spatial_guidance_model.load_lora(args.spatial_guidance_lora_path)
+    model.trajectory_guidance_model.load_lora(args.trajectory_guidance_lora_path)
+
+    if args.guide_mode == "guide_concat":
+        model.spatial_guidance_model.change_pool("None")
+        model.trajectory_guidance_model.change_pool("None")
 
     # perform dust3r/mast3r and get pointmaps
     guidance_3d, guidance_traj, focals, poses, pts3d = predict_3d(model, args)
 
+    if args.guide_mode == "baseline":
+        guidance_3d = None
+        guidance_traj = None
+        invert_function = model.invert
+    elif args.guide_mode == "guide_concat":
+        assert guidance_3d is not None and guidance_traj is not None
+        invert_function = model.invert
+    elif args.guide_mode == "guide_cond":
+        assert guidance_3d is not None and guidance_traj is not None
+        invert_function = model.invert_guide_cond
+    else:
+        raise ValueError("Invalid mode")
+
     # predict high-level space z_T\to0
-    flow1to2,flow2to1=predict_z0(model,args,sup_res_h,sup_res_w,guidance_3d, guidance_traj)
+    flow1to2,flow2to1=predict_z0(model, args, sup_res_h, sup_res_w, guidance_3d, guidance_traj)
         
     with torch.no_grad():
-        invert_code, pred_x0_list = model.invert(args.source_image,
+        invert_code, pred_x0_list = invert_function(args.source_image,
                                 args.prompt,
-                                # guidance_3d,
-                                # guidance_traj,
+                                guidance_3d,
+                                guidance_traj,
                                 guidance_scale=args.guidance_scale,
                                 num_inference_steps=args.n_inference_step,
                                 num_actual_inference_steps=args.n_actual_inference_step,
                                 return_intermediates=True)
-        # invert_code, pred_x0_list = model.invert_nvs(args.source_image,
-        #                         args.prompt,
-        #                         guidance_3d,
-        #                         guidance_traj,
-        #                         guidance_scale=[args.guidance_scale, args.guidance_scale_3d, args.guidance_scale_traj],
-        #                         num_inference_steps=args.n_inference_step,
-        #                         num_actual_inference_steps=args.n_actual_inference_step,
-        #                         return_intermediates=True)
         init_code = deepcopy(invert_code)
         pred_code = deepcopy(pred_x0_list[args.n_actual_inference_step])
         
@@ -81,11 +100,10 @@ def main(args):
                                         start_layer=10,
                                         total_steps=args.n_inference_step,
                                         guidance_scale=args.guidance_scale)
-                                        # guidance_scale=[args.guidance_scale, args.guidance_scale_3d, args.guidance_scale_traj])
-        if args.lora_path == "":
-            register_attention_editor_diffusers(model, editor, attn_processor='attn_proc')
-        else:
-            register_attention_editor_diffusers(model, editor, attn_processor='lora_attn_proc')
+        # if args.lora_path == "":
+        #    register_attention_editor_diffusers(model, editor, attn_processor='attn_proc')
+        # else:
+        #    register_attention_editor_diffusers(model, editor, attn_processor='lora_attn_proc')
 
         # apply inter frames attention 
         # setattr(editor, 'flag', True)
@@ -110,13 +128,12 @@ def main(args):
 
         gen_image = model(
             prompt=args.prompt,
-            # guidance_3d=guidance_3d,
-            # guidance_traj=guidance_traj,
+            guidance_3d=guidance_3d,
+            guidance_traj=guidance_traj,
             batch_size=input_latents.shape[0],
             latents=input_latents,
             pred_x0=input_pred,
-            guidance_scale=args.guidance_scale,
-            # guidance_scale=[args.guidance_scale, args.guidance_scale_3d, args.guidance_scale_traj],
+            guidance_scale=1.0,
             num_inference_steps=args.n_inference_step,
             num_actual_inference_steps=args.n_actual_inference_step,
             save_dir=args.save_dir
@@ -137,8 +154,12 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', type=str, help='diffusion model directory', required=False, default="runwayml/stable-diffusion-v1-5")
     parser.add_argument('--vae_path', type=str, help='vae model directory', default='default')
     parser.add_argument('--lora_path', type=str, help='lora model directory', required=True)
-    parser.add_argument('--guidance_path', type=str, help='guidance model directory', required=True)
+    parser.add_argument('--spatial_guidance_path', type=str, help='guidance model directory', required=True)
+    parser.add_argument('--trajectory_guidance_path', type=str, help='guidance model directory', required=True)
+    parser.add_argument('--spatial_guidance_lora_path', type=str, help='guidance model directory', required=True)
+    parser.add_argument('--trajectory_guidance_lora_path', type=str, help='guidance model directory', required=True)
     parser.add_argument('--save_dir', type=str, help='save results directory', required=False, default="./results")
+    parser.add_argument('--guide_mode', type=str, help='model mode', default='guide_concat')
     parser.add_argument('--guidance_scale', type=float, help='CFG', default=2.0)
     parser.add_argument('--guidance_scale_3d', type=float, help='CFG', default=2.0)
     parser.add_argument('--guidance_scale_traj', type=float, help='CFG', default=2.0)

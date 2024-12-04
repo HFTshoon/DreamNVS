@@ -324,8 +324,42 @@ class MovePipeline(StableDiffusionPipeline):
             z, 
             t, 
             encoder_hidden_states, 
-            # guidance_3d,
-            # guidance_traj,
+            guidance_3d,
+            guidance_traj,
+            layer_idx=[0]
+        ):
+        
+        if guidance_3d is not None and guidance_traj is not None:
+            use_guidance = True
+        else:
+            use_guidance = False
+
+        guidance_3d = guidance_3d.repeat(encoder_hidden_states.shape[0], 1, 1)
+        guidance_traj = guidance_traj.repeat(encoder_hidden_states.shape[0], 1, 1)
+
+        encoder_hidden_states = torch.cat([encoder_hidden_states, guidance_3d, guidance_traj], dim=1)
+
+        unet_output, all_intermediate_features = self.unet(
+            z,
+            t,
+            encoder_hidden_states=encoder_hidden_states,
+            return_intermediates=True
+            )
+
+        all_return_features = {}
+
+        for idx in layer_idx:
+            all_return_features[idx] = all_intermediate_features[idx]
+
+        return unet_output, all_return_features
+    
+    def forward_unet_features_guide_cond(
+            self, 
+            z, 
+            t, 
+            encoder_hidden_states, 
+            guidance_3d,
+            guidance_traj,
             layer_idx=[0]
         ):
         
@@ -354,8 +388,8 @@ class MovePipeline(StableDiffusionPipeline):
         self,
         prompt,
         prompt_embeds=None, # whether text embedding is directly provided.
-        # guidance_3d=None,
-        # guidance_traj=None,
+        guidance_3d=None,
+        guidance_traj=None,
         batch_size=1,
         height=512,
         width=512,
@@ -370,6 +404,14 @@ class MovePipeline(StableDiffusionPipeline):
         return_intermediates=False,
         **kwds):
         DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+        if guidance_3d is not None and guidance_traj is not None:
+            use_guidance = True
+        else:
+            use_guidance = False
+
+        if guidance_scale > 1.:
+            guidance_scale = 1.
 
         if prompt_embeds is None:
             if isinstance(prompt, list):
@@ -389,7 +431,16 @@ class MovePipeline(StableDiffusionPipeline):
         else:
             batch_size = prompt_embeds.shape[0]
             text_embeddings = prompt_embeds
+        print("prompt: ", prompt)
         print("input text embeddings :", text_embeddings.shape)
+
+        # add guidance to text embeddings
+        if use_guidance:
+            if batch_size > 1:
+                guidance_3d = guidance_3d.repeat(batch_size, 1, 1)
+                guidance_traj = guidance_traj.repeat(batch_size, 1, 1)
+            text_embeddings = torch.cat([text_embeddings, guidance_3d, guidance_traj], dim=1)
+            print("text embeddings with guidance: ", text_embeddings.shape)
 
         # define initial latents if not predefined
         if latents is None:
@@ -409,7 +460,24 @@ class MovePipeline(StableDiffusionPipeline):
                 return_tensors="pt"
             )
             unconditional_embeddings = self.text_encoder(unconditional_input.input_ids.to(DEVICE))[0]
+
+            if use_guidance:
+                guidance_3d_length = guidance_3d.shape[-2]
+                unconditional_input_3d = np.zeros((guidance_3d_length * 8, 3))
+                unconditional_input_3d_tensor = torch.tensor(unconditional_input_3d, device=DEVICE, dtype=torch.float32)
+                unconditional_embeddings_3d = self.spatial_guidance_model(unconditional_input_3d_tensor)
+                unconditional_embeddings_3d = unconditional_embeddings_3d.repeat(batch_size, 1, 1)
+
+                guidance_traj_length = guidance_traj.shape[-2]
+                unconditional_input_traj = np.zeros((guidance_traj_length * 2, 7))
+                unconditional_input_traj_tensor = torch.tensor(unconditional_input_traj, device=DEVICE, dtype=torch.float32)
+                unconditional_embeddings_traj = self.trajectory_guidance_model(unconditional_input_traj_tensor)
+                unconditional_embeddings_traj = unconditional_embeddings_traj.repeat(batch_size, 1, 1)
+
+                unconditional_embeddings = torch.cat([unconditional_embeddings, unconditional_embeddings_3d, unconditional_embeddings_traj], dim=1)
+
             text_embeddings = torch.cat([unconditional_embeddings, text_embeddings], dim=0)
+            print("cfg text embeddings shape: ", text_embeddings.shape)
 
         print("latents shape: ", latents.shape)
         # iterative sampling
@@ -426,6 +494,7 @@ class MovePipeline(StableDiffusionPipeline):
                 model_inputs = torch.cat([latents] * 2)
             else:
                 model_inputs = latents
+
             if unconditioning is not None and isinstance(unconditioning, list):
                 _, text_embeddings = text_embeddings.chunk(2)
                 text_embeddings = torch.cat([unconditioning[i].expand(*text_embeddings.shape), text_embeddings]) 
@@ -445,7 +514,7 @@ class MovePipeline(StableDiffusionPipeline):
                 noise_pred = self.unet(
                     model_inputs, 
                     t, 
-                    encoder_hidden_states=text_embeddings,
+                    encoder_hidden_states=text_embeddings
                     # added_cond_kwargs=added_cond_kwargs
                     )
                 inter_xt = self.get_interxt(noise_pred[1:-1], t, pred_x0[1:-1])
@@ -453,7 +522,7 @@ class MovePipeline(StableDiffusionPipeline):
                 noise_pred = self.unet(
                     latents, 
                     t, 
-                    encoder_hidden_states=text_embeddings,
+                    encoder_hidden_states=text_embeddings
                     # added_cond_kwargs=added_cond_kwargs
                     )
                 latents = self.pred_step(noise_pred, t, pred_x0) 
@@ -487,6 +556,8 @@ class MovePipeline(StableDiffusionPipeline):
         self,
         image: torch.Tensor,
         prompt,
+        guidance_3d,
+        guidance_traj,
         num_inference_steps=50,
         num_actual_inference_steps=None,
         guidance_scale=7.5,
@@ -496,6 +567,11 @@ class MovePipeline(StableDiffusionPipeline):
         """
         invert a real image into noise map with determinisc DDIM inversion
         """
+        if guidance_3d is not None and guidance_traj is not None:
+            use_guidance = True
+        else:
+            use_guidance = False
+
         DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         batch_size = image.shape[0]
         if isinstance(prompt, list):
@@ -504,6 +580,10 @@ class MovePipeline(StableDiffusionPipeline):
         elif isinstance(prompt, str):
             if batch_size > 1:
                 prompt = [prompt] * batch_size
+
+        if use_guidance and batch_size > 1:
+            guidance_3d = guidance_3d.repeat(batch_size, 1, 1)
+            guidance_traj = guidance_traj.repeat(batch_size, 1, 1)
 
         # text embeddings
         text_input = self.tokenizer(
@@ -514,6 +594,12 @@ class MovePipeline(StableDiffusionPipeline):
         )
         text_embeddings = self.text_encoder(text_input.input_ids.to(DEVICE))[0]
         print("input text embeddings :", text_embeddings.shape)
+
+        # add guidance to text embeddings
+        if use_guidance:
+            text_embeddings = torch.cat([text_embeddings, guidance_3d, guidance_traj], dim=1)
+            print("input guidance concat embeddings :", text_embeddings.shape)
+
         # define initial latents
         latents = self.image2latent(image)
 
@@ -527,7 +613,24 @@ class MovePipeline(StableDiffusionPipeline):
                 return_tensors="pt"
             )
             unconditional_embeddings = self.text_encoder(unconditional_input.input_ids.to(DEVICE))[0]
+
+            if use_guidance:
+                guidance_3d_length = guidance_3d.shape[-2]
+                unconditional_input_3d = np.zeros((guidance_3d_length * 8, 3))
+                unconditional_input_3d_tensor = torch.tensor(unconditional_input_3d, device=DEVICE, dtype=torch.float32)
+                unconditional_embeddings_3d = self.spatial_guidance_model(unconditional_input_3d_tensor)
+                unconditional_embeddings_3d = unconditional_embeddings_3d.repeat(batch_size, 1, 1)
+
+                guidance_traj_length = guidance_traj.shape[-2]
+                unconditional_input_traj = np.zeros((guidance_traj_length * 2, 7))
+                unconditional_input_traj_tensor = torch.tensor(unconditional_input_traj, device=DEVICE, dtype=torch.float32)
+                unconditional_embeddings_traj = self.trajectory_guidance_model(unconditional_input_traj_tensor)
+                unconditional_embeddings_traj = unconditional_embeddings_traj.repeat(batch_size, 1, 1)
+
+                unconditional_embeddings = torch.cat([unconditional_embeddings, unconditional_embeddings_3d, unconditional_embeddings_traj], dim=1)
+
             text_embeddings = torch.cat([unconditional_embeddings, text_embeddings], dim=0)
+            print("cfg text embeddings shape: ", text_embeddings.shape)
 
         print("latents shape: ", latents.shape)
         # interative sampling
@@ -560,7 +663,7 @@ class MovePipeline(StableDiffusionPipeline):
             # pred_x0_list = [self.latent2image(img, return_type="pt") for img in pred_x0_list]
             return latents, pred_x0_list
         return latents
-    
+
     @torch.no_grad()
     def invert_nvs(
         self,
@@ -626,13 +729,15 @@ class MovePipeline(StableDiffusionPipeline):
 
             guidance_3d_length = guidance_3d.shape[-2]
             unconditional_input_3d = np.zeros((guidance_3d_length * 8, 3))
-            unconditional_embeddings_3d = self.guidance_model.compute_3D_guidance(unconditional_input_3d)
+            unconditional_input_3d_tensor = torch.tensor(unconditional_input_3d, device=DEVICE, dtype=torch.float32)
+            unconditional_embeddings_3d = self.spatial_guidance_model(unconditional_input_3d_tensor)
             unconditional_embeddings_3d = unconditional_embeddings_3d.repeat(batch_size, 1, 1)
             spatial_embeddings = torch.cat([unconditional_embeddings_3d, unconditional_embeddings_3d, guidance_3d, guidance_3d], dim=0)
 
             guidance_traj_length = guidance_traj.shape[-2]
             unconditional_input_traj = np.zeros((guidance_traj_length * 2, 7))
-            unconditional_embeddings_traj = self.guidance_model.compute_trajectory_guidance(unconditional_input_traj)
+            unconditional_input_traj_tensor = torch.tensor(unconditional_input_traj, device=DEVICE, dtype=torch.float32)
+            unconditional_embeddings_traj = self.trajectory_guidance_model(unconditional_input_traj_tensor)
             unconditional_embeddings_traj = unconditional_embeddings_traj.repeat(batch_size, 1, 1)
             trajectory_embeddings = torch.cat([unconditional_embeddings_traj, unconditional_embeddings_traj, unconditional_embeddings_traj, guidance_traj], dim=0)
 

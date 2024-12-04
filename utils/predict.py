@@ -54,52 +54,57 @@ def splat_flowmax(frame1, frame2, flow, time):
     # out_soft, mask = softsplat(tenIn=frame1, tenFlow=flow*time, tenMetric=(0.3 - tenMetric).clip(0.001, 1.0), strMode='max')
     return ((0.3-tenMetric).clip(0.001, 1.0))*time
 
-def predict_z0(model, args, sup_res_h, sup_res_w, guidance_3d, guidance_traj):
+def predict_z0(model, args, sup_res_h, sup_res_w, guidance_3d=None, guidance_traj=None, mode = "baseline"):
+    if args.guide_mode == "baseline":
+        guidance_3d = None
+        guidance_traj = None
+        invert_function = model.invert
+        forward_unet_features = model.forward_unet_features
+    elif args.guide_mode == "guide_concat":
+        assert guidance_3d is not None and guidance_traj is not None
+        invert_function = model.invert
+        forward_unet_features = model.forward_unet_features
+    elif args.guide_mode == "guide_cond":
+        assert guidance_3d is not None and guidance_traj is not None
+        invert_function = model.invert_guide_cond
+        forward_unet_features = model.forward_unet_features_guide_cond
+    else:
+        raise ValueError("Invalid mode")
+
+
     with torch.no_grad():
-        invert_code, pred_x0_list = model.invert(args.source_image,
+        invert_code, pred_x0_list = invert_function(args.source_image,
                                 args.prompt,
+                                guidance_3d=guidance_3d,
+                                guidance_traj=guidance_traj,
                                 guidance_scale=args.guidance_scale,
                                 num_inference_steps=args.n_inference_step,
-                                num_actual_inference_steps=args.feature_inversion,
+                                num_actual_inference_steps=args.n_actual_inference_step,
                                 return_intermediates=True)
-        # invert_code, pred_x0_list = model.invert_nvs(args.source_image,
-        #                         args.prompt,
-        #                         guidance_3d,
-        #                         guidance_traj,
-        #                         guidance_scale=args.guidance_scale,
-        #                         num_inference_steps=args.n_inference_step,
-        #                         num_actual_inference_steps=args.feature_inversion,
-        #                         return_intermediates=True)
+
         init_code = deepcopy(invert_code)
         model.scheduler.set_timesteps(args.n_inference_step)
         t = model.scheduler.timesteps[args.n_inference_step - args.feature_inversion]
         text_emb = model.get_text_embeddings(args.prompt).detach()
-        unet_output, all_return_features = model.forward_unet_features(
+        unet_output, all_return_features = forward_unet_features(
             init_code, 
             t, 
             encoder_hidden_states=text_emb.repeat(2,1,1),
-            # guidance_3d=guidance_3d,
-            # guidance_traj=guidance_traj,
+            guidance_3d=guidance_3d,
+            guidance_traj=guidance_traj,
             layer_idx=args.unet_feature_idx
             )
         F0 = all_return_features[args.unet_feature_idx[0]]
 
         invert_code, pred_x0_list = model.invert(args.source_image,
                                 args.prompt,
-                                # guidance_3d,
-                                # guidance_traj,
+                                guidance_3d=guidance_3d,
+                                guidance_traj=guidance_traj,
                                 guidance_scale=args.guidance_scale,
                                 num_inference_steps=args.n_inference_step,
                                 num_actual_inference_steps=args.n_actual_inference_step,
                                 return_intermediates=True)
-        # invert_code, pred_x0_list = model.invert_nvs(args.source_image,
-        #                         args.prompt,
-        #                         guidance_3d,
-        #                         guidance_traj,
-        #                         guidance_scale=args.guidance_scale,
-        #                         num_inference_steps=args.n_inference_step,
-        #                         num_actual_inference_steps=args.n_actual_inference_step,
-        #                         return_intermediates=True)
+        
         init_code = deepcopy(invert_code)
         pred_code = deepcopy(pred_x0_list[args.n_actual_inference_step])
         

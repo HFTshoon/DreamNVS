@@ -52,6 +52,8 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import TEXT_ENCODER_ATTN_MODULE, check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
+from utils.condition_encoder import load_spatial_guidance_model, load_trajectory_guidance_model
+from utils.predict_3d import get_guidance_input
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.17.0")
@@ -238,6 +240,16 @@ def parse_args(input_args=None):
         "--train_text_encoder",
         action="store_true",
         help="Whether to train the text encoder. If set, the text encoder should be float32 precision.",
+    )
+    parser.add_argument(
+        '--train_spatial_encoder',
+        action='store_true',
+        help='Whether to train the spatial encoder. If set, the spatial encoder should be float32 precision.'
+    )
+    parser.add_argument(
+        '--train_trajectory_encoder',
+        action='store_true',
+        help='Whether to train the trajectory encoder. If set, the trajectory encoder should be float32 precision.'
     )
     parser.add_argument(
         "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
@@ -441,6 +453,24 @@ def parse_args(input_args=None):
         default='default',
         help="vae"
     )
+    parser.add_argument(
+        "--spatial_guidance_path",
+        type=str,
+        default='default',
+        help="guidance"
+    )
+    parser.add_argument(
+        "--trajectory_guidance_path",
+        type=str,
+        default='default',
+        help="guidance"
+    )
+    parser.add_argument(
+        "--guide_mode",
+        type=str,
+        default='guide_concat',
+        help="guide mode"
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -488,6 +518,8 @@ class DreamBoothDataset(Dataset):
         encoder_hidden_states=None,
         instance_prompt_encoder_hidden_states=None,
         tokenizer_max_length=None,
+        spatial_info=None,
+        trajectory_info=None,
     ):
         self.size = size
         self.center_crop = center_crop
@@ -495,6 +527,8 @@ class DreamBoothDataset(Dataset):
         self.encoder_hidden_states = encoder_hidden_states
         self.instance_prompt_encoder_hidden_states = instance_prompt_encoder_hidden_states
         self.tokenizer_max_length = tokenizer_max_length
+        self.spatial_info = spatial_info
+        self.trajectory_info = trajectory_info
 
         self.instance_data_root = Path(instance_data_root)
         if not self.instance_data_root.exists():
@@ -503,9 +537,12 @@ class DreamBoothDataset(Dataset):
         self.instance_images_path = list(Path(instance_data_root).iterdir())
 
         # get only image file end with .jpg, .jpeg, .png
+        actual_instance_images_path = []
         for image_path in self.instance_images_path:
-            if image_path.suffix.lower() not in [".jpg", ".jpeg", ".png"]:
-                self.instance_images_path.remove(image_path)
+            if image_path.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                actual_instance_images_path.append(image_path)
+        self.instance_images_path = actual_instance_images_path
+        print(self.instance_images_path)
 
         self.num_instance_images = len(self.instance_images_path)
         self.instance_prompt = instance_prompt
@@ -571,6 +608,9 @@ class DreamBoothDataset(Dataset):
                 example["class_prompt_ids"] = class_text_inputs.input_ids
                 example["class_attention_mask"] = class_text_inputs.attention_mask
 
+        example["spatial_info"] = self.spatial_info
+        example["trajectory_info"] = self.trajectory_info
+
         return example
 
 
@@ -603,6 +643,9 @@ def collate_fn(examples, with_prior_preservation=False):
 
     if has_attention_mask:
         batch["attention_mask"] = attention_mask
+
+    batch["spatial_info"] = [example["spatial_info"] for example in examples]
+    batch["trajectory_info"] = [example["trajectory_info"] for example in examples]
 
     return batch
 
@@ -785,6 +828,26 @@ def main(args):
     else:
         vae = AutoencoderKL.from_pretrained(args.vae_path)
 
+    if args.guide_mode == "guide_concat":
+        if args.spatial_guidance_path != "default" and not args.spatial_guidance_path.endswith("_768.pth"):
+            args.spatial_guidance_path = args.spatial_guidance_path.replace(".pth", "_768.pth")
+        if args.trajectory_guidance_path != "default" and not args.trajectory_guidance_path.endswith("_768.pth"):
+            args.trajectory_guidance_path = args.trajectory_guidance_path.replace(".pth", "_768.pth")
+
+    if args.spatial_guidance_path != "default":
+        spatial_guidance_model = load_spatial_guidance_model(args.spatial_guidance_path)
+        if args.guide_mode == "guide_concat":
+            spatial_guidance_model.change_pool("None")
+    else:
+        spatial_guidance_model = None
+
+    if args.trajectory_guidance_path != "default":
+        trajectory_guidance_model = load_trajectory_guidance_model(args.trajectory_guidance_path)
+        if args.guide_mode == "guide_concat":
+            trajectory_guidance_model.change_pool("None")
+    else:
+        trajectory_guidance_model = None
+
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
@@ -794,6 +857,28 @@ def main(args):
         vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
+
+    if spatial_guidance_model is not None:
+        for name, param in spatial_guidance_model.named_parameters():
+            if args.train_spatial_encoder:
+                if 'lora' not in name:
+                    param.requires_grad = False
+                else:
+                    print(name)
+                    print(param.data)
+            else:
+                param.requires_grad = False
+
+    if trajectory_guidance_model is not None:
+        for name, param in trajectory_guidance_model.named_parameters():
+            if args.train_trajectory_encoder:
+                if 'lora' not in name:
+                    param.requires_grad = False
+                else:
+                    print(name)
+                    print(param.data)
+            else:
+                param.requires_grad = False
 
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
@@ -808,6 +893,10 @@ def main(args):
     if vae is not None:
         vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
+    if spatial_guidance_model is not None:
+        spatial_guidance_model.to(accelerator.device)
+    if trajectory_guidance_model is not None:
+        trajectory_guidance_model.to(accelerator.device)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -969,6 +1058,21 @@ def main(args):
         if args.train_text_encoder
         else unet_lora_layers.parameters()
     )
+
+    guidance_params_to_optimize = None
+    # add guidance model to optimizer
+    if spatial_guidance_model is not None:
+        if args.train_spatial_encoder:
+            spatial_parameters = filter(lambda p: p.requires_grad, spatial_guidance_model.parameters())
+            guidance_params_to_optimize = spatial_parameters
+    if trajectory_guidance_model is not None:
+        if args.train_trajectory_encoder:
+            trajectory_parameters = filter(lambda p: p.requires_grad, trajectory_guidance_model.parameters())
+            if guidance_params_to_optimize is not None:
+                guidance_params_to_optimize = itertools.chain(guidance_params_to_optimize, trajectory_parameters)
+            else:
+                guidance_params_to_optimize = trajectory_parameters
+
     optimizer = optimizer_class(
         params_to_optimize,
         lr=args.learning_rate,
@@ -976,6 +1080,17 @@ def main(args):
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
+
+    if guidance_params_to_optimize is not None:
+        optimizer2 = optimizer_class(
+            guidance_params_to_optimize,
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+        )
+    else:
+        optimizer2 = None
 
     if args.pre_compute_text_embeddings:
 
@@ -1015,6 +1130,15 @@ def main(args):
         validation_prompt_negative_prompt_embeds = None
         pre_computed_instance_prompt_encoder_hidden_states = None
 
+
+    if spatial_guidance_model is not None and trajectory_guidance_model is not None:
+        spatial_info, trajectory_info = get_guidance_input(args.instance_data_dir)
+        spatial_info = torch.from_numpy(spatial_info).to(accelerator.device)
+        trajectory_info = torch.from_numpy(trajectory_info).to(accelerator.device)
+    else:
+        spatial_info = None
+        trajectory_info = None
+
     # Dataset and DataLoaders creation:
     train_dataset = DreamBoothDataset(
         instance_data_root=args.instance_data_dir,
@@ -1028,6 +1152,8 @@ def main(args):
         encoder_hidden_states=pre_computed_encoder_hidden_states,
         instance_prompt_encoder_hidden_states=pre_computed_instance_prompt_encoder_hidden_states,
         tokenizer_max_length=args.tokenizer_max_length,
+        spatial_info=spatial_info,
+        trajectory_info=trajectory_info,
     )
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -1053,16 +1179,57 @@ def main(args):
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
     )
+    if optimizer2 is not None:
+        lr_scheduler2 = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer2,
+            num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+            num_cycles=args.lr_num_cycles,
+            power=args.lr_power,
+        )
+    else:
+        lr_scheduler2 = None
 
     # Prepare everything with our `accelerator`.
     if args.train_text_encoder:
-        unet_lora_layers, text_encoder_lora_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet_lora_layers, text_encoder_lora_layers, optimizer, train_dataloader, lr_scheduler
-        )
+        if args.train_spatial_encoder:
+            if args.train_trajectory_encoder:
+                unet_lora_layers, text_encoder_lora_layers, spatial_guidance_model, trajectory_guidance_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    unet_lora_layers, text_encoder_lora_layers, spatial_guidance_model, trajectory_guidance_model, optimizer, train_dataloader, lr_scheduler
+                )
+            else:
+                unet_lora_layers, text_encoder_lora_layers, spatial_guidance_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    unet_lora_layers, text_encoder_lora_layers, spatial_guidance_model, optimizer, train_dataloader, lr_scheduler
+                )
+        else:
+            if args.train_trajectory_encoder:
+                unet_lora_layers, text_encoder_lora_layers, trajectory_guidance_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    unet_lora_layers, text_encoder_lora_layers, trajectory_guidance_model, optimizer, train_dataloader, lr_scheduler
+                )
+            else:
+                unet_lora_layers, text_encoder_lora_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    unet_lora_layers, text_encoder_lora_layers, optimizer, train_dataloader, lr_scheduler
+                )
     else:
-        unet_lora_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet_lora_layers, optimizer, train_dataloader, lr_scheduler
-        )
+        if args.train_spatial_encoder:
+            if args.train_trajectory_encoder:
+                unet_lora_layers, spatial_guidance_model, trajectory_guidance_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    unet_lora_layers, spatial_guidance_model, trajectory_guidance_model, optimizer, train_dataloader, lr_scheduler
+                )
+            else:
+                unet_lora_layers, guidance_lora_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    unet_lora_layers, guidance_lora_layers, optimizer, train_dataloader, lr_scheduler
+                )
+        else:
+            if args.train_trajectory_encoder:
+                unet_lora_layers, trajectory_guidance_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    unet_lora_layers, trajectory_guidance_model, optimizer, train_dataloader, lr_scheduler
+                )
+            else:
+                unet_lora_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    unet_lora_layers, optimizer, train_dataloader, lr_scheduler
+                )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1123,6 +1290,13 @@ def main(args):
         unet.train()
         if args.train_text_encoder:
             text_encoder.train()
+        if spatial_guidance_model is not None:
+            if args.train_spatial_encoder:
+                spatial_guidance_model.train()
+        if trajectory_guidance_model is not None:
+            if args.train_trajectory_encoder:
+                trajectory_guidance_model.train()
+
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
@@ -1162,6 +1336,14 @@ def main(args):
                         batch["attention_mask"],
                         text_encoder_use_attention_mask=args.text_encoder_use_attention_mask,
                     )
+                    if spatial_guidance_model is not None and batch["spatial_info"] is not None:
+                        spatial_info = batch["spatial_info"][0].to(dtype=weight_dtype)
+                        guidance_3d = spatial_guidance_model(spatial_info).to(dtype=weight_dtype)
+                        encoder_hidden_states = torch.cat([encoder_hidden_states, guidance_3d], dim=1)
+                    if trajectory_guidance_model is not None and batch["trajectory_info"] is not None:
+                        trajectory_info = batch["trajectory_info"][0].to(dtype=weight_dtype)
+                        guidance_traj = trajectory_guidance_model(trajectory_info).to(dtype=weight_dtype)
+                        encoder_hidden_states = torch.cat([encoder_hidden_states, guidance_traj], dim=1)
 
                 if accelerator.unwrap_model(unet).config.in_channels == channels * 2:
                     noisy_model_input = torch.cat([noisy_model_input, noisy_model_input], dim=1)
@@ -1170,10 +1352,13 @@ def main(args):
                     class_labels = timesteps
                 else:
                     class_labels = None
-
+                
                 # Predict the noise residual
                 model_pred = unet(
-                    noisy_model_input, timesteps, encoder_hidden_states, class_labels=class_labels
+                    noisy_model_input, 
+                    timesteps, 
+                    encoder_hidden_states, 
+                    class_labels=class_labels
                 ).sample
 
                 # if model predicts variance, throw away the prediction. we will only train on the
@@ -1213,10 +1398,26 @@ def main(args):
                         if args.train_text_encoder
                         else unet_lora_layers.parameters()
                     )
+
+                    if spatial_guidance_model is not None:
+                        if args.train_spatial_encoder:
+                            spatial_parameters = filter(lambda p: p.requires_grad, spatial_guidance_model.parameters())
+                            params_to_clip = itertools.chain(params_to_clip, spatial_parameters)
+
+                    if trajectory_guidance_model is not None:
+                        if args.train_trajectory_encoder:
+                            trajectory_parameters = filter(lambda p: p.requires_grad, trajectory_guidance_model.parameters())
+                            params_to_clip = itertools.chain(params_to_clip, trajectory_parameters)
+
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+
+                if optimizer2 is not None:
+                    optimizer2.step()
+                    lr_scheduler2.step()
+                    optimizer2.zero_grad()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -1323,6 +1524,29 @@ def main(args):
             unet_lora_layers=unet_lora_layers,
             text_encoder_lora_layers=text_encoder_lora_layers
         )
+
+        print("--------------------------------")
+        print("Saving guidance models")
+        if spatial_guidance_model is not None:
+            for name, param in spatial_guidance_model.named_parameters():
+                if args.train_spatial_encoder:
+                    if 'lora' in name:
+                        print(name)
+                        print(param.data)
+
+        if trajectory_guidance_model is not None:
+            for name, param in trajectory_guidance_model.named_parameters():
+                if args.train_trajectory_encoder:
+                    if 'lora' in name:
+                        print(name)
+                        print(param.data)
+
+        if spatial_guidance_model is not None:
+            if args.train_spatial_encoder:
+                spatial_guidance_model.save_lora("./guidance/spatial_guidance_model_dreambooth_lora.pth")
+        if trajectory_guidance_model is not None:
+            if args.train_trajectory_encoder:
+                trajectory_guidance_model.save_lora("./guidance/trajectory_guidance_model_dreambooth_lora.pth")
 
     accelerator.end_training()
 
