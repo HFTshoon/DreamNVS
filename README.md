@@ -1,10 +1,7 @@
 <p align="center">
   <h1 align="center">DreamNVS: Using Image Interpolation for Novel View Synthesis</h1>
   <p align="center">
-    <strong>2024-2 Generative Artificial Intelligence</strong>
-  </p>
-  <p align="center">
-    <strong>Team 0</strong>
+    <strong>2024-2 Generative Artificial Intelligence Team 0</strong>
   </p>
   <p align="center">
     <strong>2023-27692 이은호 (Eunho Lee)</strong>
@@ -18,11 +15,21 @@
   </p>
 
   <div align="center">
-        <img src="./assets/teaser.png", width="900">
+        <img src="./assets/teaser_dreammover.png", width="900">
+  </div>
+  <div align="center">
+        <img src="./assets/pipeline.png", width="900">
   </div>
 </p>
 
 ## Installation
+We provide Docker from dockerhub!
+```
+docker pull eunho112498/dreamnvs:1.0 
+```
+
+If you want to customize or make it on your own, follow below.
+
 First, get codes from the repo
 ```
 git clone --recursive https://github.com/HFTshoon/DreamNVS.git
@@ -31,20 +38,13 @@ git clone --recursive https://github.com/HFTshoon/DreamNVS.git
 # git submodule update --init --recursive
 ```
 
-Then, download following files
+Then, download following MAST3R checkpoint
 ```
 mkdir -p checkpoints/
 wget https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth -P checkpoints/
 ```
 
-We provide Docker from dockerhub!
-```
-docker pull eunho112498/dreamnvs:1.0 
-```
-
-If you want to customize or make it on your own, follow below.
-
-This code is tested in CUDA 11.8, python 3.9.
+This code is tested in `CUDA 11.8`, `python 3.9`.
 
 Make sure the python version is not below python 3.9 or above 3.10; It will not work.
 ```
@@ -63,11 +63,11 @@ You can download the pretrained model Stable Diffusion v1.5 from [Huggingface](h
 
 
 ## Usage
-To start with, run the following command to train a Lora for image pair:
+To start with, run the following command to train a per-scene Lora for image pair:
 
 This will generate `./guidance/spatial_guidance_model_dreambooth_lora.pth`, `./guidance/trajectory_guidance_model_dreambooth_lora.pth` and `./lora/lora_ckpt/demo/004/pytorch_lora_weights.bin`
 
-Following weights are already included in the repo, so you don't have to do it if you just try the main inference.
+Following weights are already included in the repo, so you don't have to do it if you just try the main inference for the `./demo/004` scene.
 ```
 # don't have to it because lora weights are already included
 # python -m lora.train_dreambooth_lora --instance_data_dir ./demo/004/ --lora_rank 16 --spatial_guidance_path ./guidance/spatial_guidance_model.pth --trajectory_guidance_path ./guidance/trajectory_guidance_model.pth --train_spatial_encoder --train_trajectory_encoder --guide_mode guide_concat
