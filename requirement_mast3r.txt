@@ -1,0 +1,9 @@
+torch
+torchvision
+roma
+matplotlib
+scipy
+trimesh
+tensorboard
+pyglet<2
+scikit-learn

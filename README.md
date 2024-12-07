@@ -1,22 +1,20 @@
 <p align="center">
-  <h1 align="center">DreamMover: Leveraging the Prior of Diffusion Models for Image Interpolation with Large Motion</h1>
+  <h1 align="center">DreamNVS: Using Image Interpolation for Novel View Synthesis</h1>
   <p align="center">
-    <a href="https://leoshen917.github.io/"><strong>Liao Shen</strong></a>
-    &nbsp;&nbsp;
-    <a href="https://tqtqliu.github.io/"><strong>Tianqi Liu</strong></a>
-    &nbsp;&nbsp;
-    <a href="https://huiqiang-sun.github.io/"><strong>Huiqiang Sun</strong></a>
-    &nbsp;&nbsp;
-    <a href="https://scholar.google.com/citations?user=g_Y0w7MAAAAJ&hl"><strong>Xinyi Ye</strong></a>
-    &nbsp;&nbsp;
-    <a href="https://orcid.org/0000-0002-9032-3991"><strong>Baopu Li</strong></a>
-    &nbsp;&nbsp;
-    <a href="https://jimmie33.github.io/"><strong>Jianming Zhang</strong></a>
-    &nbsp;&nbsp;
-    <a href="http://english.aia.hust.edu.cn/info/1085/1528.htm"><strong>Zhiguo Cao<sep>✉</sep></strong></a>
+    <strong>2024-2 Generative Artificial Intelligence</strong>
   </p>
   <p align="center">
-    <sep>✉</sep>Corresponding Autor
+    <strong>Team 0</strong>
+  </p>
+  <p align="center">
+    <strong>2023-27692 이은호 (Eunho Lee)</strong>
+    &emsp;&emsp;
+    <strong> 2024-20878 정승훈 (Seunghoon Jeong) </strong>
+  </p>
+  <p align="center">
+    <strong>2024-21384 조주환 (Juhwan Jo) </strong>
+    &emsp;&emsp;
+    <strong>2024-20986 장현수 (Hyunsu Jang) </strong>
   </p>
 
   <div align="center">
@@ -25,60 +23,65 @@
 </p>
 
 ## Installation
+First, get codes from the repo
 ```
-git clone https://github.com/leoShen917/DreamMover.git
-cd DreamMover
-conda create -n mover python=3.8.5
-conda activate mover
-pip install -r requirement.txt
+git clone --recursive https://github.com/HFTshoon/DreamNVS.git
+
+# if you already clone the repo without submodules,
+# git submodule update --init --recursive
+```
+
+Then, download following files
+```
+mkdir -p checkpoints/
+wget https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth -P checkpoints/
+```
+
+We provide Docker from dockerhub!
+```
+docker pull eunho112498/dreamnvs:1.0 
+```
+
+If you want to customize or make it on your own, follow below.
+
+This code is tested in CUDA 11.8, python 3.9.
+
+Make sure the python version is not below python 3.9 or above 3.10; It will not work.
+```
+cd DreamNVS
+conda create -n dreamnvs python=3.9 cmake=3.31.0
+conda activate dreamnvs
+pip install -r requirement_dreammover.txt
+conda install pytorch torchvision pytorch-cuda=11.8 -c pytorch -c 
+pip install -r requirement_mast3r.txt
+pip install -r requirement_dreamnvs.txt
+cd ../
 ```
 You can download the pretrained model Stable Diffusion v1.5 from [Huggingface](https://huggingface.co/runwayml/stable-diffusion-v1-5), and specify the `model_path` to your local directory.
 
 [Optional] You can download the fine-tuned vae model from [Huggingface](https://huggingface.co/stabilityai/sd-vae-ft-mse) for better performance.
 
-## Run Gradio UI
-To start the Gradio UI of DreamMover, run the following in your environment:
-```bash
-python gradio_ui.py
-```
-Then, by default, you can access the UI at [http://127.0.0.1:7860](http://127.0.0.1:7860).
-
-<div align="center">
-  <img src="./assets/ui.png", width="900">
-</div>
 
 ## Usage
 To start with, run the following command to train a Lora for image pair:
+
+This will generate `./guidance/spatial_guidance_model_dreambooth_lora.pth`, `./guidance/trajectory_guidance_model_dreambooth_lora.pth` and `./lora/lora_ckpt/demo/004/pytorch_lora_weights.bin`
+
+Following weights are already included in the repo, so you don't have to do it if you just try the main inference.
 ```
-python lora/train_dreambooth_lora.py --pretrained_model_name_or_path [model_path] --instance_data_dir [img_path] --output_dir [lora_path] --instance_prompt [prompt] --lora_rank 16
+# don't have to it because lora weights are already included
+# python -m lora.train_dreambooth_lora --instance_data_dir ./demo/004/ --lora_rank 16 --spatial_guidance_path ./guidance/spatial_guidance_model.pth --trajectory_guidance_path ./guidance/trajectory_guidance_model.pth --train_spatial_encoder --train_trajectory_encoder --guide_mode guide_concat
 ```
 
 After that, we now can run the main code:
 ```
 python main.py \
-  --prompt [prompt] --img_path [img_path] --model_path [model_path] --vae_path [vae_path] --lora_path [lora_path] --save_dir [save_dir] --Time 33
-```
-The script also supports the following options:
-- `--prompt`: Prompt of the image pair(default: "")
-- `--img_path`: Path of the image pair
-- `--model_path`: Pretrained model path (default: "runwayml/stable-diffusion-v1-5")
-- `--vae_path`: vae model path (default= "default")
-- `--lora_path`: lora model path (the output path of train_lora)
-- `--save_dir`: path of the output images (default= "./results")
-- `--Time`: the frames of generated video
-
-## Citation
-
-If you find our work useful in your research, please consider to cite our paper:
-
-```
-@article{shen2024dreammover,
-  title={DreamMover: Leveraging the Prior of Diffusion Models for Image Interpolation with Large Motion},
-  author={Shen, Liao and Liu, Tianqi and Sun, Huiqiang and Ye, Xinyi and Li, Baopu and Zhang, Jianming and Cao, Zhiguo},
-  journal={arXiv preprint arXiv:2409.09605},
-  year={2024}
-}
+ --img_path ./demo/004 --lora_path ./lora/lora_ckpt/demo/004 \
+ --spatial_guidance_path ./guidance/spatial_guidance_model.pth \
+ --trajectory_guidance_path ./guidance/trajectory_guidance_model.pth \
+ --spatial_guidance_lora_path ./guidance/spatial_guidance_model_dreambooth_lora.pth \
+ --trajectory_guidance_lora_path ./guidance/trajectory_guidance_model_dreambooth_lora.pth
 ```
 
 ## Acknowledgement
-This code borrows heavily from [DragDiffusion](https://github.com/Yujun-Shi/DragDiffusion), [DiffMorpher](https://github.com/Kevin-thu/DiffMorpher) and [Diffusers](https://github.com/huggingface/diffusers). We thank the respective authors for open sourcing their method.
+This code borrows heavily from [DreamMover](https://github.com/leoShen917/DreamMover), [GaussianObject](https://github.com/chensjtu/GaussianObject) and [Diffusers](https://github.com/huggingface/diffusers). We thank the respective authors for open sourcing their method.
