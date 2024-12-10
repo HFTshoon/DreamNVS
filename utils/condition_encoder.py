@@ -338,5 +338,68 @@ if __name__ == '__main__':
             optimizer.step()
 
         print(f'epoch [{epoch+1}/{num_epochs}], loss: {loss.item():.4f}')
-        spatial_model.save_lora(f"./guidance/spatial_guidance_model_{spatial_pool}_lora.pth")
-        trajectory_model.save_lora(f"./guidance/trajectory_guidance_model_{trajectory_pool}_lora.pth")
+        spatial_model.save_lora(f"./guidance/spatial_guidance_model_{out_dim}_lora.pth")
+        trajectory_model.save_lora(f"./guidance/trajectory_guidance_model_{out_dim}_lora.pth")
+        
+    # --------------------------------------------------------------
+    # full train - batch
+    # lora 제외 모든 파라미터 학습
+    # for param in spatial_model.parameters():
+    #     if 'lora' in param.name:
+    #         param.requires_grad = False
+    #     param.requires_grad = True
+        
+    # for param in trajectory_model.parameters():
+    #     if 'lora' in param.name:
+    #         param.requires_grad = False
+    #     param.requires_grad = True
+        
+    # # 학습 가능한 파라미터 수 확인
+    # total_params = sum(p.numel() for p in spatial_model.parameters()) + sum(p.numel() for p in trajectory_model.parameters())
+    # trainable_params = sum(p.numel() for p in spatial_model.parameters() if p.requires_grad) + sum(p.numel() for p in trajectory_model.parameters() if p.requires_grad)
+    # print(f'총 파라미터 수: {total_params}, 학습 가능한 파라미터 수: {trainable_params}')
+
+    # # 옵티마이저 및 손실 함수 정의
+    # spatial_parameters = filter(lambda p: p.requires_grad, spatial_model.parameters())
+    # trajectory_parameters = filter(lambda p: p.requires_grad, trajectory_model.parameters())
+    # optimizer = optim.Adam(list(spatial_parameters) + list(trajectory_parameters), lr=1e-3)
+    # criterion = nn.MSELoss()
+
+    # # 데이터셋 및 데이터로더 생성
+    # spatial_dataset = DemoPointCloudDataset()
+    # trajectory_dataset = DemoTrajectoryDataset()
+
+    # spatial_dataloader = DataLoader(spatial_dataset, batch_size=32, shuffle=True)
+    # trajectory_dataloader = DataLoader(trajectory_dataset, batch_size=32, shuffle=True)
+
+    # # 학습 루프
+    # num_epochs = 10
+    # for epoch in range(num_epochs):
+    #     spatial_model.train()
+    #     trajectory_model.train()
+
+    #     for P, T in zip(spatial_dataloader, trajectory_dataloader):
+    #         P = P.to(device)
+    #         T = T.to(device)
+
+    #         # 순전파
+    #         P_output = spatial_model(P)
+    #         T_output = trajectory_model(T)
+
+    #         # 임의의 타깃 벡터 생성 (예시용)
+    #         P_target = torch.randn(P_output.shape).to(device)
+    #         T_target = torch.randn(T_output.shape).to(device)
+
+    #         # 손실 계산
+    #         loss = criterion(P_output, P_target) + criterion(T_output, T_target)
+
+    #         # 역전파 및 옵티마이저 스텝
+    #         optimizer.zero_grad()
+    #         loss.backward()
+    #         optimizer.step()
+
+    #     print(f'epoch [{epoch+1}/{num_epochs}], loss: {loss.item():.4f}')
+    #     spatial_model.save_model(f"./guidance/spatial_guidance_model_trained_{out_dim}.pth")
+    #     trajectory_model.save_model(f"./guidance/trajectory_guidance_model_trained_{out_dim}.pth")
+        
+    

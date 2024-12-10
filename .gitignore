@@ -1,7 +1,6 @@
 lora_tmp/
 lora-dreambooth-model/
 results*/
-*.pth
 
 __pycache__/
 *.pyc
