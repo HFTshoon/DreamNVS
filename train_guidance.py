@@ -1,21 +1,65 @@
 import os
 import argparse
 import torch
+import numpy as np
 
 from utils.condition_encoder import SpatialGuidanceModel, TrajectoryGuidanceModel, load_spatial_guidance_model, load_trajectory_guidance_model
 from utils.predict_3d import get_guidance_input
 
+import random
+
 class CO3DGuidanceTrainDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir):
         self.data_dir = data_dir
-        self.data_files = os.listdir(data_dir)
+        self.data_files = []
+        # Iterate through each sequences for each object
+        for obj_name in os.listdir(data_dir):
+            obj_path = os.path.join(data_dir, obj_name)
+            for seq_name in os.listdir(obj_path):
+                seq_path = os.path.join(obj_path, seq_name)
+                if not os.path.isdir(seq_path):
+                    continue
+
+                # For each subsets, randomly assign another subset for extrapolation
+                subsets = []
+                for file_name in os.listdir(seq_path):
+                    if file_name[0].isdigit():
+                        subsets.append(file_name[:-4])
+                
+                for subset in subsets:
+                    if len(subsets) > 1:
+                        extra = random.choice([k for k in subsets if k != subset])
+                        self.data_files.append([os.path.join(obj_name, seq_name), subset, extra])
+
         
     def __len__(self):
         return len(self.data_files)
     
     def __getitem__(self, idx):
-        # TODO
-        return None
+        data = self.data_files[idx]
+        base_path = os.path.join(self.data_dir, data[0])
+        with open(os.path.join(base_path, f"image_{data[1]}.txt")) as f:
+            image_path = f.read().splitlines()
+        
+        with open(os.path.join(base_path, f"image_{data[2]}.txt")) as f:
+            image_path_extra = f.read().splitlines()
+        
+        spatial_info = np.load(os.path.join(base_path, f"{data[1]}.npy"))
+        traj_info = np.load(os.path.join(base_path, f"poses_{data[1]}.npy"))
+        traj_info_extra = np.load(os.path.join(base_path, f"poses_{data[2]}.npy"))
+        focal = np.load(os.path.join(base_path, f"focals_{data[1]}.npy"))
+        focal_extra = np.load(os.path.join(base_path, f"focals_{data[2]}.npy"))
+
+        
+        return {
+            "image_path": image_path,
+            "image_path_extra": image_path_extra,
+            "spatial_info": spatial_info,
+            "traj_info": traj_info,
+            "traj_info_extra": traj_info_extra,
+            "focal": focal,
+            "focal_extra": focal_extra
+        }
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train guidance')
@@ -250,6 +294,29 @@ def main(args):
     
     
 if __name__ == '__main__':
+    # data_dir = "../co3d_sample_preprocess"
+    # train_dataset = CO3DGuidanceTrainDataset(
+    #     data_dir
+    # )
+    # batch_size = 1
+    # dataloader_num_workers = 1
+    # train_dataloader = torch.utils.data.DataLoader(
+    #     train_dataset,
+    #     batch_size=batch_size,
+    #     num_workers=dataloader_num_workers,
+    #     shuffle=True
+    # )
+
+    # for i, batch in enumerate(train_dataloader):
+    #     print(len(batch["image_path"]))
+    #     print(len(batch["image_path_extra"]))
+    #     print(batch["spatial_info"].shape)
+    #     print(batch["traj_info"].shape)
+    #     print(batch["traj_info_extra"].shape)
+    #     print(batch["focal"].shape)
+    #     print(batch["focal_extra"].shape)
+    #     break
+
     # Parse the arguments
     args = parse_args()
     # Run the main function
