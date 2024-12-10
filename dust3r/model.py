@@ -6,6 +6,7 @@
 # --------------------------------------------------------
 from copy import deepcopy
 import torch
+import os
 
 from .utils.misc import fill_default_args, freeze_all_params, is_symmetrized, interleave, transpose_to_landscape
 from .heads import head_factory
@@ -15,6 +16,23 @@ import dust3r.utils.path_to_croco  # noqa: F401
 from models.croco import CroCoNet  # noqa
 inf = float('inf')
 
+def load_model(model_path, device, verbose=True):
+    if verbose:
+        print('... loading model from', model_path)
+    ckpt = torch.load(model_path, map_location='cpu')
+    args = ckpt['args'].model.replace("ManyAR_PatchEmbed", "PatchEmbedDust3R")
+    if 'landscape_only' not in args:
+        args = args[:-1] + ', landscape_only=False)'
+    else:
+        args = args.replace(" ", "").replace('landscape_only=True', 'landscape_only=False')
+    assert "landscape_only=False" in args
+    if verbose:
+        print(f"instantiating : {args}")
+    net = eval(args)
+    s = net.load_state_dict(ckpt['model'], strict=False)
+    if verbose:
+        print(s)
+    return net.to(device)
 
 class AsymmetricCroCo3DStereo (CroCoNet):
     """ Two siamese encoders, followed by two decoders.
@@ -40,6 +58,17 @@ class AsymmetricCroCo3DStereo (CroCoNet):
         self.set_downstream_head(output_mode, head_type, landscape_only, depth_mode, conf_mode, **croco_kwargs)
         self.set_freeze(freeze)
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kw):
+        if os.path.isfile(pretrained_model_name_or_path):
+            return load_model(pretrained_model_name_or_path, device='cpu')
+        else:
+            try:
+                model = super(AsymmetricCroCo3DStereo, cls).from_pretrained(pretrained_model_name_or_path, **kw)
+            except TypeError as e:
+                raise Exception(f'tried to load {pretrained_model_name_or_path} from huggingface, but failed')
+            return model
+        
     def _set_patch_embed(self, img_size=224, patch_size=16, enc_embed_dim=768):
         self.patch_embed = get_patch_embed(self.patch_embed_cls, img_size, patch_size, enc_embed_dim)
 
