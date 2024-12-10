@@ -5,7 +5,7 @@ import torch
 import numpy as np
 import open3d as o3d
 
-from traj_enc.util_traj import traj2vec
+from utils.util_traj import traj2vec
 from utils.recon_3d import recon_3d_mast3r, recon_3d_dust3r
 from utils.make_trajectory import generate_smooth_camera_path
 
@@ -62,8 +62,9 @@ def get_trajectory(img_dir, poses, length = 100):
         with open(trajectory_path, 'r') as f:
             data_trajectory = json.load(f)
 
-        trajectory = np.array(data_trajectory['trajectory']) # (N, 7)
+        trajectory = np.array(data_trajectory['trajectory']) # (N, 4, 4)
     else:
+        assert poses is not None
         first_pose = poses[0].detach().cpu().numpy()
         last_pose = poses[-1].detach().cpu().numpy()
         positions, rotations = generate_smooth_camera_path(first_pose[:3,:3], first_pose[:3,3], last_pose[:3,:3], last_pose[:3,3], length)
@@ -111,9 +112,9 @@ def predict_3d(model, args, use_mast3r=True):
     extrinsics, intrinsics = get_extrinsics_intrinsics(args.img_path)
 
     if use_mast3r:
-        imgs, focals, poses, pps, pts3d, confidence_masks, matches_im0, matches_im1 = recon_3d_mast3r(args.img_path, extrinsics, intrinsics)
+        imgs, focals, poses, pps, pts3d, conf, confidence_masks, matches_im0, matches_im1 = recon_3d_mast3r(args.img_path, extrinsics, intrinsics)
     else:
-        imgs, focals, poses, pps, pts3d, confidence_masks, matches_im0, matches_im1 = recon_3d_mast3r(args.img_path, extrinsics, intrinsics)
+        imgs, focals, poses, pps, pts3d, conf, confidence_masks, matches_im0, matches_im1 = recon_3d_dust3r(args.img_path, extrinsics, intrinsics)
 
     trajectory = traj2vec(get_trajectory(args.img_path, poses))
     trajectory_tensor = torch.from_numpy(trajectory).float().to(model.trajectory_guidance_model.device)
@@ -152,7 +153,7 @@ def predict_3d(model, args, use_mast3r=True):
     guidance_traj = model.trajectory_guidance_model(trajectory_tensor)
     print(f"Guidance 3D: {guidance_3d.shape}, Guidance Trajectory: {guidance_traj.shape}")
 
-    return guidance_3d, guidance_traj, focals, poses, pts3d
+    return guidance_3d, guidance_traj, focals, pps, poses, pts3d, conf
 
     match_mask0 = np.zeros((confidence_mask0.shape[0], confidence_mask0.shape[1]))
     match_mask1 = np.zeros((confidence_mask1.shape[0], confidence_mask1.shape[1]))

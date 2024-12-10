@@ -10,6 +10,7 @@ import argparse
 from diffusers import DDIMScheduler, AutoencoderKL
 from utils.attn_utils import register_attention_editor_diffusers, MutualSelfAttentionControl
 from utils.predict import predict_z0, splat_flowmax
+from utils.predict_opflow import predict_z0_opflow
 from utils.predict_3d import predict_3d
 # from utils.condition_encoder_legacy import load_guidance_model
 from utils.condition_encoder import load_spatial_guidance_model, load_trajectory_guidance_model
@@ -63,7 +64,7 @@ def main(args):
         model.trajectory_guidance_model.change_pool("None")
 
     # perform dust3r/mast3r and get pointmaps
-    guidance_3d, guidance_traj, focals, poses, pts3d = predict_3d(model, args)
+    guidance_3d, guidance_traj, focals, pps, poses, pts3d, conf = predict_3d(model, args)
 
     if args.guide_mode == "baseline":
         guidance_3d = None
@@ -78,8 +79,11 @@ def main(args):
     else:
         raise ValueError("Invalid mode")
 
-    # predict high-level space z_T\to0
-    flow1to2,flow2to1=predict_z0(model, args, sup_res_h, sup_res_w, guidance_3d, guidance_traj)
+    # predict high-level space z_T\to0 (baseline)
+    # flow1to2,flow2to1=predict_z0(model, args, sup_res_h, sup_res_w, guidance_3d, guidance_traj)
+
+    # predict high-level space z_T\to0 (dreamnvs)
+    flow1to2,flow2to1=predict_z0_opflow(model, args, sup_res_h, sup_res_w, pts3d, guidance_3d, guidance_traj)
         
     with torch.no_grad():
         invert_code, pred_x0_list = invert_function(args.source_image,
