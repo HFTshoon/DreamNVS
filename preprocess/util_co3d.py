@@ -5,9 +5,12 @@ from typing import List, Tuple, Optional, Dict, Any, Type, IO, cast
 
 import numpy as np
 
-from util_traj import focal2fov, rotmat2qvec
-from util_data import CameraInfo, SceneInfo, SeqInfo
-from co3d.dataset.data_types import FrameAnnotation, load_dataclass_jgzip
+from preprocess.util_traj import focal2fov, rotmat2qvec
+from preprocess.util_data import CameraInfo, SceneInfo, SeqInfo
+from preprocess.util_co3d_dust3r import get_CO3D_dust3r_scene, get_dust3r_model
+
+from preprocess.co3d.co3d.dataset.data_types import FrameAnnotation, load_dataclass_jgzip
+
 
 def read_CO3D_scene_info(path):
     dataset_path = os.path.dirname(path)
@@ -23,7 +26,8 @@ def read_CO3D_scene_info(path):
         height = frame.image.size[0]
         FovX = focal2fov(frame.viewpoint.focal_length[0] * width / 2, width)
         FovY = focal2fov(frame.viewpoint.focal_length[1] * height / 2, height)
-        cam_info = CameraInfo(uid=1, R=R, T=T, FovY=FovY, FovX=FovX, # image=image,
+        pps = np.array([width/2, height/2])
+        cam_info = CameraInfo(uid=1, R=R, T=T, FovY=FovY, FovX=FovX, pps=pps, # image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height)
         cam_infos.append(cam_info)
     cam_infos = sorted(cam_infos.copy(), key = lambda x : x.image_name)
@@ -145,3 +149,42 @@ def get_CO3D_seq_info(scene_info, base_dir, seq_num=0, seq_name=""):
 
     seq_info = SeqInfo(seq_cameras=seq_cam_infos, average_distance=average_distance)
     return seq_info
+
+def get_CO3D_pointcloud(scene_info, base_dir, preprocess_dir, seq_name, sample_n):
+    seq_cam_infos = []
+    for camera_info in scene_info.train_cameras:
+        if camera_info.image_path.startswith(os.path.join(base_dir, seq_name)):
+            seq_cam_infos.append(camera_info)
+
+    seq_cam_infos = sorted(seq_cam_infos.copy(), key = lambda x : x.image_name)
+
+    assert len(seq_cam_infos) > 0
+
+    divided_list = []
+
+    num_images_per_seq = 20
+    num_images_lower_bound = 5
+    for i in range(0, len(seq_cam_infos) // num_images_per_seq + 1):
+        div_list = seq_cam_infos[i * num_images_per_seq : min((i + 1) * num_images_per_seq, len(seq_cam_infos))]
+        if len(div_list) >= num_images_lower_bound:
+            divided_list.append(div_list)
+        
+    model_path = 'checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth'
+    device = 'cuda'
+    model = get_dust3r_model(model_path, device)
+
+    failed_list = []
+    for imlist in divided_list:
+        try:
+            image_list, pts3d_sampled, poses, focals, start_idx, end_idx = get_CO3D_dust3r_scene(model, imlist, sample_n)
+        except:
+            print(f"Error in sequence {seq_name}")
+            failed_list.append(seq_name)
+        if not os.path.exists(os.path.join(preprocess_dir, seq_name)):
+            os.makedirs(os.path.join(preprocess_dir, seq_name), exist_ok=True)
+        with open(os.path.join(preprocess_dir, seq_name, f"image_{start_idx}_{end_idx}.txt"), "w") as f:
+            f.write("\n".join(image_list))
+        np.save(os.path.join(preprocess_dir, seq_name, f"{start_idx}_{end_idx}.npy"), pts3d_sampled)
+        np.save(os.path.join(preprocess_dir, seq_name, f"poses_{start_idx}_{end_idx}.npy"), poses.detach().cpu().numpy())
+        np.save(os.path.join(preprocess_dir, seq_name, f"focals_{start_idx}_{end_idx}.npy"), focals.detach().cpu().numpy())
+    print(f"Failed sequences: {failed_list}")

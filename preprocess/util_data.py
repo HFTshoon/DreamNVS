@@ -8,6 +8,7 @@ class CameraInfo(NamedTuple):
     T: np.array
     FovY: np.array
     FovX: np.array
+    pps: np.array
     # image: np.array
     image_path: str
     image_name: str

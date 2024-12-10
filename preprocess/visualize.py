@@ -5,8 +5,8 @@ import argparse
 import numpy as np
 import open3d as o3d
 
-from util_co3d import load_CO3D_data
-from util_traj import rotmat2qvec
+from preprocess.util_co3d import load_CO3D_data
+from preprocess.util_traj import rotmat2qvec
 
 def get_camera_frustum(img_size, hfov, vfov, C2W, frustum_length=1, color=[0., 1., 0.]):
     W, H = img_size
@@ -135,7 +135,7 @@ if __name__ == "__main__":
     if args.seq_num != -1:
         args.seq_name = seq_list[min(args.seq_num, len(seq_list)-1)]
     
-    seq_info = object_info = data[args.object][args.seq_name]
+    seq_info = data[args.object][args.seq_name]
     visualize_trajectory(seq_info, resolution=1, verbose=True)
     
     
