@@ -144,10 +144,8 @@ def predict_3d(model, args, use_mast3r=True):
     pts3d_sample = np.concatenate([pts3d1_sample, pts3d2_sample], axis=0)
     pts3d_sample_tensor = torch.from_numpy(pts3d_sample).float().to(model.spatial_guidance_model.device)
 
-    print(model.spatial_guidance_model.device)
     pts3d_sample_tensor.to(model.spatial_guidance_model.device)
     trajectory_tensor.to(model.trajectory_guidance_model.device)
-    print(pts3d_sample_tensor.device, trajectory_tensor.device)
 
     guidance_3d = model.spatial_guidance_model(pts3d_sample_tensor)
     guidance_traj = model.trajectory_guidance_model(trajectory_tensor)
