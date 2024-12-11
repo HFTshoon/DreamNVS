@@ -26,11 +26,13 @@ def project_points(P, R, T, K):
     - pts_2d: (N, 2) 2D 이미지 좌표
     """
     # 카메라 좌표계로 변환
-    P_cam = (R @ P.T).T + T  # (N, 3)
-    
+    # P_cam = (R @ P.T).T + T  # (N, 3)
+    P_cam = (P - T) @ R # (N, 3)
+
     # 투영 (핀홀 카메라 모델)
-    P_proj = (K @ P_cam.T).T  # (N, 3)
-    
+    # P_proj = (K @ P_cam.T).T  # (N, 3)
+    P_proj = P_cam @ K.T  # (N, 3)
+
     # 정규화
     pts_2d = P_proj[:, :2] / P_proj[:, 2, np.newaxis]
     
@@ -57,6 +59,14 @@ def compute_optical_flow(P, R_source, T_source, R_query, T_query, K):
     # 쿼리 뷰에서의 2D 투영
     pts_query = project_points(P, R_query, T_query, K)  # (N, 2)
     
+    # for i in range(10):
+    #     print(round(pts_source[i][0]), round(pts_source[i][1]), "->", round(pts_query[i][0]), round(pts_query[i][1]))
+
+    # idx = np.random.choice(len(pts_source), 10, replace=False)
+    # for i in idx:
+    #     # round
+    #     print(round(pts_source[i][0]), round(pts_source[i][1]), "->", round(pts_query[i][0]), round(pts_query[i][1]))
+
     # Optical Flow 계산
     flow = pts_query - pts_source  # (N, 2)
     
