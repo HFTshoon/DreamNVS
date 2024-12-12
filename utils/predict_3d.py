@@ -87,9 +87,9 @@ def get_trajectory(img_dir, poses, length = 20):
 def get_guidance_input(img_path, use_mast3r=True):
     extrinsics, intrinsics = get_extrinsics_intrinsics(img_path)
     if use_mast3r:
-        _, _, poses, _, pts3d, confidence_masks, _, _ = recon_3d_mast3r(img_path, extrinsics, intrinsics)
+        _, _, poses, _, pts3d, _, confidence_masks, _, _ = recon_3d_mast3r(img_path, extrinsics, intrinsics)
     else:
-        _, _, poses, _, pts3d, confidence_masks, _, _ = recon_3d_mast3r(img_path, extrinsics, intrinsics)
+        _, _, poses, _, pts3d, _, confidence_masks, _, _ = recon_3d_mast3r(img_path, extrinsics, intrinsics)
     trajectory = traj2vec(get_trajectory(img_path, poses))
 
     # tensor to numpy

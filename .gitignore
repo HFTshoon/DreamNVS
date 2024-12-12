@@ -6,3 +6,4 @@ checkpoints/*.pth
 
 __pycache__/
 *.pyc
+guidance-train-*/

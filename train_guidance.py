@@ -1,5 +1,8 @@
 
 import os
+import logging
+# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# os.environ["TORCH_USE_CUDA_DSA"] = '1'
 
 import argparse
 import itertools
@@ -7,6 +10,7 @@ import itertools
 from PIL import Image
 import torch
 import torch.nn.functional as F
+torch.autograd.set_detect_anomaly(True)
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -27,8 +31,21 @@ from diffusers import (
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
+from diffusers.utils.import_utils import is_xformers_available
 
 import random
+
+def setup_logger(logger_name, log_file, level=logging.INFO):
+    logger = logging.getLogger(logger_name)
+    formatter = logging.Formatter('%(asctime)s : %(message)s')
+    fileHandler = logging.FileHandler(log_file, mode='a')
+    fileHandler.setFormatter(formatter)
+    logger.setLevel(level)
+    logger.addHandler(fileHandler)
+    streamHandler = logging.StreamHandler()
+    streamHandler.setFormatter(formatter)
+    logger.addHandler(streamHandler)
+    return logger
 
 class CO3DGuidanceTrainDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir):
@@ -104,7 +121,7 @@ def get_images(image_path_list):
     longer_side = max(min_h, min_w)
     target_h = int(min_h / longer_side * 512)
     target_w = int(min_w / longer_side * 512)
-    print(min_h, min_w, " -> ", target_h, target_w)
+    # print(min_h, min_w, " -> ", target_h, target_w)
 
     # crop the image to the minimum size from the center
     resized_imgs = [] # (N, H, W, 3)
@@ -160,6 +177,8 @@ def parse_args():
 def main(args):
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
+
+    logger = setup_logger('train_log', os.path.join(args.output_dir, 'log.txt'))
         
     tokenizer = AutoTokenizer.from_pretrained(
         args.diffusion_load_path,
@@ -189,6 +208,7 @@ def main(args):
     )
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cpu")
 
     if args.guide_mode == 'guide_concat':
         out_dim = 768
@@ -215,30 +235,32 @@ def main(args):
         
     if vae is not None:
         vae.requires_grad_(False)
-        vae.to(device)
+        vae.to(device, dtype = torch.float32)
     text_encoder.requires_grad_(False)
-    text_encoder.to(device)
+    text_encoder.to(device, dtype = torch.float32)
     unet.requires_grad_(False)
-    unet.to(device)
+    unet.to(device, dtype = torch.float32)
+    unet.enable_xformers_memory_efficient_attention()
     
     spatial_guidance_model.requires_grad_(args.train_spatial_guidance)
     trajectory_guidance_model.requires_grad_(args.train_trajectory_guidance)
-    spatial_guidance_model.to(device)
-    trajectory_guidance_model.to(device)
+    spatial_guidance_model.to(device, dtype = torch.float32)
+    trajectory_guidance_model.to(device, dtype = torch.float32)
     
-    params_to_optimize = None
-    print("Spatial guidance model trainable parameters: ", sum(p.numel() for p in spatial_guidance_model.parameters() if p.requires_grad))
-    print("Trajectory guidance model trainable parameters: ", sum(p.numel() for p in trajectory_guidance_model.parameters() if p.requires_grad))
+    params_to_optimize = itertools.chain(unet.parameters(), text_encoder.parameters(), vae.parameters())
+    # params_to_optimize = None
+
+    # print("Spatial guidance model trainable parameters: ", sum(p.numel() for p in spatial_guidance_model.parameters() if p.requires_grad))
+    # print("Trajectory guidance model trainable parameters: ", sum(p.numel() for p in trajectory_guidance_model.parameters() if p.requires_grad))
     if args.train_spatial_guidance:
         spatial_parameters = spatial_guidance_model.parameters()
-        params_to_optimize = spatial_parameters
+        params_to_optimize = itertools.chain(params_to_optimize, spatial_parameters)
     if args.train_trajectory_guidance:
         trajectory_parameters = trajectory_guidance_model.parameters()
         if params_to_optimize is not None:
             params_to_optimize = itertools.chain(params_to_optimize, trajectory_parameters)
         else:
             params_to_optimize = trajectory_parameters
-    
     assert params_to_optimize is not None
     
     optimizer = torch.optim.AdamW(
@@ -274,7 +296,7 @@ def main(args):
     start_extra_epoch = 0
     start_extra_step = 10000
     use_extra_prob = 0.4
-
+   
     for epoch in range(args.num_train_epochs):
         unet.train()
         
@@ -285,6 +307,7 @@ def main(args):
         
         progress_bar = tqdm(range(0, max_train_steps))
         progress_bar.set_description("Steps")
+        global_step = 0
         
         for step, batch in enumerate(train_dataloader):
             use_extra = epoch >= start_extra_epoch \
@@ -332,17 +355,23 @@ def main(args):
             )[0]
             guidance_3d = spatial_guidance_model(spatial_info)
             guidance_traj = trajectory_guidance_model(traj_info.to(device))
-            encoder_hidden_states = torch.cat([guidance_text, guidance_3d, guidance_traj], dim=1)
+            encoder_hidden_states_single = torch.cat([guidance_text, guidance_3d, guidance_traj], dim=1)
+            # encoder_hidden_states_single = guidance_text
             # (1, 593, 768)
 
-            encoder_hidden_states = encoder_hidden_states.repeat(noisy_model_input.shape[0], 1, 1)
+            encoder_hidden_states = encoder_hidden_states_single.repeat(noisy_model_input.shape[0], 1, 1)
+            # (20, 593, 768)
+
+            noisy_model_input = noisy_model_input.to(device)
+            encoder_hidden_states_single = encoder_hidden_states_single.to(device)
+            timesteps = timesteps.to(dtype=torch.float32)
 
             model_pred = unet(
                 noisy_model_input,
                 timesteps,
                 encoder_hidden_states,
             ).sample
-            
+
             if model_pred.shape[1] == 6:
                 model_pred, _ = torch.chunk(model_pred, 2, dim=1)
 
@@ -356,11 +385,16 @@ def main(args):
 
             # model_pred, target (N, C, H, W)
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            # print("model_pred: ", model_pred.device, model_pred.dtype, model_pred.shape)
+            # print("target: ", target.device, target.dtype, target.shape)
+            # print(loss)
+            logger.info(f"Epoch: {epoch}, Step: {step}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {loss.item()}")
             loss.backward()
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
         
+            progress_bar.update(1)
             global_step += 1
             logs = {
                 "loss": loss.detach().item(),
@@ -370,12 +404,18 @@ def main(args):
             
             if global_step >= max_train_steps:
                 break
-        
-    print("Training done.")
-    if args.train_spatial_guidance:
-        spatial_guidance_model.save_model(os.path.join(args.output_dir, "spatial_guidance_model_trained.pth"))
-    if args.train_trajectory_guidance:
-        trajectory_guidance_model.save_model(os.path.join(args.output_dir, "trajectory_guidance_model_trained.pth"))
+
+            if step % 100 == 0:
+                if args.train_spatial_guidance:
+                    spatial_guidance_model.save_model(os.path.join(args.output_dir, f"spatial_guidance_model_epoch{epoch}_step{step}.pth"))
+                if args.train_trajectory_guidance:
+                    trajectory_guidance_model.save_model(os.path.join(args.output_dir, f"trajectory_guidance_model_epoch{epoch}_step{step}.pth"))
+
+        print("Training done.")
+        if args.train_spatial_guidance:
+            spatial_guidance_model.save_model(os.path.join(args.output_dir, f"spatial_guidance_model_epoch{epoch}_fin.pth"))
+        if args.train_trajectory_guidance:
+            trajectory_guidance_model.save_model(os.path.join(args.output_dir, f"trajectory_guidance_model_epoch{epoch}_fin.pth"))
     
 if __name__ == '__main__':
     # data_dir = "/mydata/data/hyunsoo/co3d_sample_preprocess"
