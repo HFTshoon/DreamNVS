@@ -1,10 +1,32 @@
+
 import os
+
 import argparse
+import itertools
+
+from PIL import Image
 import torch
+import torch.nn.functional as F
+
 import numpy as np
+from tqdm.auto import tqdm
+
 
 from utils.condition_encoder import SpatialGuidanceModel, TrajectoryGuidanceModel, load_spatial_guidance_model, load_trajectory_guidance_model
 from utils.predict_3d import get_guidance_input
+from utils.util_traj import traj2vec
+
+from transformers import AutoTokenizer, CLIPTextModel
+import diffusers
+from diffusers import (
+    AutoencoderKL,
+    DDPMScheduler,
+    DiffusionPipeline,
+    DPMSolverMultistepScheduler,
+    StableDiffusionPipeline,
+    UNet2DConditionModel,
+)
+from diffusers.optimization import get_scheduler
 
 import random
 
@@ -61,6 +83,47 @@ class CO3DGuidanceTrainDataset(torch.utils.data.Dataset):
             "focal_extra": focal_extra
         }
 
+def get_images(image_path_list):
+    imgs = []
+    img_size = []
+    for image_path in image_path_list:
+        img = Image.open(image_path[0])
+
+        # if image is rgba, remove alpha channel (4 -> 3)
+        if img.mode == 'RGBA':
+            img = img.convert('RGB')
+
+        img_size.append(img.size)
+        imgs.append(img)
+
+    # get minimum h and w
+    min_h = min([h for h, w in img_size])
+    min_w = min([w for h, w in img_size])
+    
+    # make the longer side to 512
+    longer_side = max(min_h, min_w)
+    target_h = int(min_h / longer_side * 512)
+    target_w = int(min_w / longer_side * 512)
+    print(min_h, min_w, " -> ", target_h, target_w)
+
+    # crop the image to the minimum size from the center
+    resized_imgs = [] # (N, H, W, 3)
+    for img in imgs:
+        h, w = img.size
+        left = (w - min_w) // 2
+        top = (h - min_h) // 2
+        right = (w + min_w) // 2
+        bottom = (h + min_h) // 2
+        img = img.crop((top, left, bottom, right))
+        img = img.resize((target_h, target_w))
+        img = np.array(img)
+        resized_imgs.append(img)
+
+    resized_imgs = np.array(resized_imgs)
+    resized_imgs = torch.from_numpy(resized_imgs).float() / 127.5 - 1
+    resized_imgs = resized_imgs.permute(0, 3, 1, 2)
+    return resized_imgs # (N, 3, H, W)
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train guidance')
     parser.add_argument('--diffusion_load_path', type=str, default="runwayml/stable-diffusion-v1-5", help='Diffusion model huggingface model load path')
@@ -76,7 +139,7 @@ def parse_args():
     # parser.add_argument('--num_train_steps', type=int, default=200, help='Number of steps')
     
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--scale_lr', action='store_true', help='Scale learning rate')
+    parser.add_argument('--scale_lr', action='store_true', default=False, help='Scale learning rate')
     parser.add_argument('--lr_scheduler', type=str, default='constant', 
                         help='Learning rate scheduler ["linear", "cosine", "cosine_with_restarts", "polynomial","constant", "constant_with_warmup"]')
     parser.add_argument('--lr_warmup_steps', type=int, default=0, help='Number of warmup steps')
@@ -101,38 +164,38 @@ def main(args):
     tokenizer = AutoTokenizer.from_pretrained(
         args.diffusion_load_path,
         subfolder='tokenizer',
-        revision=False,
+        revision=None,
         use_fast=False,
     )
     
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDPMScheduler.from_pretrained(args.diffusion_load_path, subfolder="scheduler")
         
     text_encoder = CLIPTextModel.from_pretrained(
         args.diffusion_load_path,
         subfolder='text_encoder',
-        revision=False
+        revision=None
     )
     
-    vae = AutoEncoderKL.from_pretrained(
+    vae = AutoencoderKL.from_pretrained(
         args.diffusion_load_path,
         subfolder='vae',
-        revision=False
+        revision=None
     )
     
     unet = UNet2DConditionModel.from_pretrained(
         args.diffusion_load_path,
         subfolder='unet',
-        revision=False
+        revision=None
     )
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.guide_mode == 'guide_concat':
         out_dim = 768
-        if args.spatial_guidance_path is not None and not args.spatial_guidance_path.endswith("_768.pth"):
-            args.spatial_guidance_path = args.spatial_guidance_path.replace(".pth", "_768.pth")
-        if args.trajectory_guidance_path is not None and not args.trajectory_guidance_path.endswith("_768.pth"):
-            args.trajectory_guidance_path = args.trajectory_guidance_path.replace(".pth", "_768.pth")
+        if args.spatial_guidance_model_load_path is not None and not args.spatial_guidance_model_load_path.endswith("_768.pth"):
+            args.spatial_guidance_model_load_path = args.spatial_guidance_model_load_path.replace(".pth", "_768.pth")
+        if args.trajectory_guidance_model_load_path is not None and not args.trajectory_guidance_model_load_path.endswith("_768.pth"):
+            args.trajectory_guidance_model_load_path = args.trajectory_guidance_model_load_path.replace(".pth", "_768.pth")
     
     if args.spatial_guidance_model_load_path is None:
         spatial_guidance_model = SpatialGuidanceModel(output_dim=out_dim)
@@ -164,11 +227,13 @@ def main(args):
     trajectory_guidance_model.to(device)
     
     params_to_optimize = None
+    print("Spatial guidance model trainable parameters: ", sum(p.numel() for p in spatial_guidance_model.parameters() if p.requires_grad))
+    print("Trajectory guidance model trainable parameters: ", sum(p.numel() for p in trajectory_guidance_model.parameters() if p.requires_grad))
     if args.train_spatial_guidance:
-        spatial_parameters = filter(lambda p: p.requires_grad, spatial_guidance_model.parameters())
+        spatial_parameters = spatial_guidance_model.parameters()
         params_to_optimize = spatial_parameters
     if args.train_trajectory_guidance:
-        trajectory_parameters = filter(lambda p: p.requires_grad, trajectory_guidance_model.parameters())
+        trajectory_parameters = trajectory_guidance_model.parameters()
         if params_to_optimize is not None:
             params_to_optimize = itertools.chain(params_to_optimize, trajectory_parameters)
         else:
@@ -206,29 +271,44 @@ def main(args):
         power=args.lr_power,
     )
     
+    start_extra_epoch = 0
+    start_extra_step = 10000
+    use_extra_prob = 0.4
+
     for epoch in range(args.num_train_epochs):
-        if vae is not None:
-            vae.eval()
-        unet.eval()
-        text_encoder.eval()
+        unet.train()
         
         if args.train_spatial_guidance:
             spatial_guidance_model.train()
         if args.train_trajectory_guidance:
             trajectory_guidance_model.train()
         
-        progress_bar = tqdm(range(0, args.max_train_steps))
+        progress_bar = tqdm(range(0, max_train_steps))
         progress_bar.set_description("Steps")
         
         for step, batch in enumerate(train_dataloader):
-            # TODO
-            input = batch["input"]
+            use_extra = epoch >= start_extra_epoch \
+                    and step > start_extra_step \
+                    and random.random() < use_extra_prob
+
+            if use_extra:
+                imgs = get_images(batch["image_path_extra"])
+                traj_info = traj2vec(batch["traj_info_extra"][0].numpy()).astype(np.float32)
+                # focals = batch["focal_extra"]
+            else:
+                imgs = get_images(batch["image_path"])
+                traj_info = traj2vec(batch["traj_info"][0].numpy()).astype(np.float32)
+                # focals = batch["focal"]
+            spatial_info = batch["spatial_info"][0]
             
+            imgs = imgs.to(device)
+            traj_info = torch.tensor(traj_info).to(device)
+            spatial_info = spatial_info.to(device)
             if vae is not None:
-                model_input = vae.encode(input).latent_dist
+                model_input = vae.encode(imgs).latent_dist
                 model_input = model_input.sample() * vae.config.scaling_factor
             else:
-                model_input = input
+                model_input = imgs
                 
             noise = torch.randn_like(model_input)
             bsz, channels, height, width = model_input.shape
@@ -239,24 +319,32 @@ def main(args):
             timesteps = timesteps.long()
             
             noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
-            guidance_text = encode_prompt(
-                text_encoder,
-                batch["input_ids"],
-                batch["attention_mask"],
-                text_encoder_use_attention_mask=args.text_encoder_use_attention_mask,
-            )
-            guidance_3d = spatial_guidance_model(batch["spatial_info"][0])
-            guidance_traj = trajectory_guidance_model(batch["trajectory_info"][0])
+            input_ids = tokenizer(
+                "",
+                truncation=True,
+                padding="max_length",
+                max_length=77,
+                return_tensors="pt",
+            ).input_ids.to(device)
+            guidance_text = text_encoder(
+                input_ids,
+                attention_mask=None,
+            )[0]
+            guidance_3d = spatial_guidance_model(spatial_info)
+            guidance_traj = trajectory_guidance_model(traj_info.to(device))
             encoder_hidden_states = torch.cat([guidance_text, guidance_3d, guidance_traj], dim=1)
-            
+            # (1, 593, 768)
+
+            encoder_hidden_states = encoder_hidden_states.repeat(noisy_model_input.shape[0], 1, 1)
+
             model_pred = unet(
                 noisy_model_input,
                 timesteps,
                 encoder_hidden_states,
-            )
+            ).sample
             
             if model_pred.shape[1] == 6:
-                    model_pred, _ = torch.chunk(model_pred, 2, dim=1)
+                model_pred, _ = torch.chunk(model_pred, 2, dim=1)
 
             # Get the target for loss depending on the prediction type
             if noise_scheduler.config.prediction_type == "epsilon":
@@ -266,6 +354,7 @@ def main(args):
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
+            # model_pred, target (N, C, H, W)
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
             loss.backward()
             optimizer.step()
@@ -287,14 +376,9 @@ def main(args):
         spatial_guidance_model.save_model(os.path.join(args.output_dir, "spatial_guidance_model_trained.pth"))
     if args.train_trajectory_guidance:
         trajectory_guidance_model.save_model(os.path.join(args.output_dir, "trajectory_guidance_model_trained.pth"))
-        
-
-            
-
-    
     
 if __name__ == '__main__':
-    # data_dir = "../co3d_sample_preprocess"
+    # data_dir = "/mydata/data/hyunsoo/co3d_sample_preprocess"
     # train_dataset = CO3DGuidanceTrainDataset(
     #     data_dir
     # )
