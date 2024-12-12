@@ -55,7 +55,7 @@ def get_extrinsics_intrinsics(img_dir):
 
     return extrinsics, intrinsics
 
-def get_trajectory(img_dir, poses, length = 100):
+def get_trajectory(img_dir, poses, length = 20):
     trajectory_path = os.path.join(img_dir, 'trajectory.json')
 
     if os.path.exists(trajectory_path):

@@ -11,7 +11,7 @@ from diffusers import DDIMScheduler, AutoencoderKL
 from utils.attn_utils import register_attention_editor_diffusers, MutualSelfAttentionControl
 from utils.predict import predict_z0, splat_flowmax
 from utils.predict_opflow import predict_z0_opflow
-from utils.predict_3d import predict_3d
+from utils.predict_3d import predict_3d, get_trajectory
 # from utils.condition_encoder_legacy import load_guidance_model
 from utils.condition_encoder import load_spatial_guidance_model, load_trajectory_guidance_model
 from diffusers.utils.import_utils import is_xformers_available
@@ -73,18 +73,21 @@ def main(args):
     elif args.guide_mode == "guide_concat":
         assert guidance_3d is not None and guidance_traj is not None
         invert_function = model.invert
+        predict_function = predict_z0_opflow
+
     elif args.guide_mode == "guide_cond":
         assert guidance_3d is not None and guidance_traj is not None
         invert_function = model.invert_guide_cond
     else:
         raise ValueError("Invalid mode")
 
-    # predict high-level space z_T\to0 (baseline)
-    # flow1to2,flow2to1=predict_z0(model, args, sup_res_h, sup_res_w, guidance_3d, guidance_traj)
+    if args.guide_mode == "baseline":
+        flow1to2,flow2to1=predict_z0(model, args, sup_res_h, sup_res_w, guidance_3d, guidance_traj)
+    elif args.guide_mode == "guide_concat":
+        flow1to2,flow2to1=predict_z0_opflow(model, args, sup_res_h, sup_res_w, pts3d, conf, guidance_3d, guidance_traj)
+    else:
+        raise NotImplementedError
 
-    # predict high-level space z_T\to0 (dreamnvs)
-    flow1to2,flow2to1=predict_z0_opflow(model, args, sup_res_h, sup_res_w, pts3d, guidance_3d, guidance_traj)
-        
     with torch.no_grad():
         invert_code, pred_x0_list = invert_function(args.source_image,
                                 args.prompt,
@@ -116,8 +119,9 @@ def main(args):
         input_pred = []
         input_latents.append(init_code[:1])
         input_pred.append(pred_code[:1])
-        
-        for i in range(1,args.Time):
+
+        trajectory = get_trajectory(args.img_path, None)
+        for i in range(1,args.Time): 
             time = i/args.Time
             metric1 = splat_flowmax(init_code[:1], init_code[1:], flow1to2, 1-time)
             metric2 = splat_flowmax(init_code[1:], init_code[:1], flow2to1, time)

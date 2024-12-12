@@ -1,5 +1,6 @@
 import os
 import tempfile
+import numpy as np
 
 from mast3r.model import AsymmetricMASt3R
 from mast3r.fast_nn import fast_reciprocal_NNs
@@ -50,7 +51,7 @@ def recon_3d_mast3r(img_dir, extrinsics=None, intrinsics=None):
     pts3d = scene.get_pts3d()               # 2 X (H, W, 3)
     pps = scene.get_principal_points()      # (2, 2)
     confidence_masks = scene.get_masks()    # 2 X (H, W)
-    conf = scene.get_conf()
+    conf = scene.get_conf()                # 2 X (H, W)
 
     # at this stage, you have the raw dust3r predictions
     view1, pred1 = output['view1'], output['pred1']
@@ -109,7 +110,8 @@ def recon_3d_dust3r(img_dir, extrinsics=None, intrinsics=None):
     pts3d = scene.get_pts3d()               # 2 X (H, W, 3)
     pps = scene.get_principal_points()      # (2, 2)
     confidence_masks = scene.get_masks()    # 2 X (H, W)
-    
+    conf = scene.get_conf()                # 2 X (H, W)
+
     pts2d_list, pts3d_list = [], []
     for i in range(2):
         conf_i = confidence_masks[i].cpu().numpy()
