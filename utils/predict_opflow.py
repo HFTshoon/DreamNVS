@@ -18,9 +18,9 @@ def vis_flow(flow, save_path):
     # draw flow image with arrow
     flow_img = np.zeros((h+200, w+200, 3), dtype=np.uint8)
 
-    for i in range(0, h, 20):
-        for j in range(0, w, 20):
-            cv2.arrowedLine(flow_img, (j+100, i+100), (j+100+int(flow_x[i,j])//10, i+100+int(flow_y[i,j])//10), (255, 255, 255), 1)
+    for i in range(0, h, h//20):
+        for j in range(0, w, w//20):
+            cv2.arrowedLine(flow_img, (j+100, i+100), (j+100+int(flow_x[i,j])//(h//10), i+100+int(flow_y[i,j])//(w//10)), (255, 255, 255), 1)
     cv2.imwrite(save_path.replace(".png", "_arrow.png"), flow_img)
 
     # clip flow value with w, h
@@ -35,15 +35,39 @@ def vis_flow(flow, save_path):
     flow_x = flow_x.astype(np.uint8)
     flow_y = flow_y.astype(np.uint8)
     
-    # fill with white
+    # save color image
     flow_img = np.zeros((h, w, 3), dtype=np.uint8)
     flow_img[:,:,0] = flow_x
-    cv2.imwrite(save_path.replace(".png", "_x.png"), flow_x)
+    cv2.imwrite(save_path.replace(".png", "_x.png"), cv2.cvtColor(flow_img, cv2.COLOR_BGR2RGB))
 
     flow_img = np.zeros((h, w, 3), dtype=np.uint8)
-    flow_img[:,:,1] = flow_y
-    cv2.imwrite(save_path.replace(".png", "_y.png"), flow_y)
-    
+    flow_img[:,:,2] = flow_y
+    cv2.imwrite(save_path.replace(".png", "_y.png"), cv2.cvtColor(flow_img, cv2.COLOR_BGR2RGB))
+
+def feature_flow(ft, forward,f_size,save_path=None):
+    if forward == False:
+        ft = torch.flip(ft, dims=[0])
+    trg_ft = nn.Upsample(size=(f_size[0], f_size[1]), mode='bilinear')(ft[1:])
+    num_channel = ft.size(1)
+    cos = nn.CosineSimilarity(dim=1)
+    flow = torch.zeros(f_size[0],f_size[1],2)
+    for i in range(f_size[0]):
+        for j in range(f_size[1]):
+            src_ft = nn.Upsample(size=(f_size[0], f_size[1]), mode='bilinear')(ft[:1])
+            src_vec = src_ft[0, :, i, j].view(1, num_channel, 1, 1)  # 1, C, 1, 1
+            cos_map = cos(src_vec, trg_ft).cpu().numpy()
+            max_yx = np.unravel_index(cos_map[0].argmax(), cos_map[0].shape)
+            flow[i,j,0]=max_yx[1]-j
+            flow[i,j,1]=max_yx[0]-i
+            del src_ft
+            del cos_map
+            torch.cuda.empty_cache()
+
+    if save_path is not None:
+        vis_flow(flow.detach().cpu().numpy(), save_path)
+
+    return flow
+
 def optical_flow(imgs, pts3d, extrinsics, intrinsics, forward, save_path, f_size):
     # imgs: (2, 3, real_H, real_W) 
     # pts3d: 2 X (H, W, 3)
@@ -66,23 +90,25 @@ def optical_flow(imgs, pts3d, extrinsics, intrinsics, forward, save_path, f_size
     flow = compute_optical_flow(input_p, input_RT[:3, :3], input_RT[:3, 3], query_RT[:3, :3], query_RT[:3, 3], K)
     flow = flow.reshape((h, w, 2))
 
-
     # pad flow to real_H, real_W
     real_h, real_w = imgs.size()[2:]
-    real_flow = np.zeros((real_h, real_w, 2))
     shift_h = (real_h - h) // 2
     shift_w = (real_w - w) // 2
-    real_flow[shift_h:shift_h+h, shift_w:shift_w+w] = flow
+    real_flow = cv2.copyMakeBorder(flow, shift_h, shift_h, shift_w, shift_w, cv2.BORDER_REPLICATE, value=0)
 
     # save x,y flow with color as image
     if save_path is not None:
         vis_flow(real_flow, save_path)
 
-    # resize flow to f_size with bilinear interpolation
-    flow = cv2.resize(flow, (f_size[1], f_size[0]), interpolation=cv2.INTER_LINEAR)
-    flow = torch.tensor(flow).cuda().float()
+    flow = cv2.resize(real_flow, (f_size[1], f_size[0]), interpolation=cv2.INTER_LINEAR)
+    size_ratio = (f_size[0] / real_w, f_size[1] / real_h)
+    resize_flow = flow * size_ratio
+    if save_path is not None:
+        vis_flow(resize_flow, save_path.replace(".png", "_resize.png"))
 
-    return flow
+    resize_flow = torch.tensor(resize_flow).cuda().float()
+
+    return resize_flow
 
 def backwarp(tenIn, tenFlow):
     backwarp_tenGrid = {}
@@ -94,22 +120,34 @@ def backwarp(tenIn, tenFlow):
     tenFlow = torch.cat([tenFlow[:, 0:1, :, :] / ((tenIn.shape[3] - 1.0) / 2.0), tenFlow[:, 1:2, :, :] / ((tenIn.shape[2] - 1.0) / 2.0)], 1)
     return torch.nn.functional.grid_sample(input=tenIn, grid=(backwarp_tenGrid[str(tenFlow.shape)] + tenFlow).permute(0, 2, 3, 1), mode='bilinear', padding_mode='zeros', align_corners=True)
 
-def splat_flow(imgs, frame1, pts3d1, conf1, extrinsics, intrinsics, sup_res_h, sup_res_w):
+def splat_flow_opt(imgs, frame1, frame2, pts3d1, conf1, extrinsics, intrinsics, flow_end2end, sup_res_h, sup_res_w, flow_save_path):
     # frame1: tensor[1,c,h,w] cuda()
     # pts3d: 2 X (H, W, 3)
-    flow = optical_flow(imgs, [pts3d1,None], extrinsics, intrinsics, forward = True, save_path=None, f_size=(sup_res_h, sup_res_w))
+    flow = optical_flow(imgs, [pts3d1,None], extrinsics, intrinsics, forward = True, save_path=flow_save_path, f_size=(sup_res_h, sup_res_w))
     flow = flow.permute(2,0,1).unsqueeze(0).cuda()
+    flow_end2end = flow_end2end.permute(2,0,1).unsqueeze(0).cuda()
 
     h, w = pts3d1.size()[:2]
     real_h, real_w = imgs.size()[2:]
     shift_h = (real_h - h) // 2
     shift_w = (real_w - w) // 2
-    conf = np.zeros((real_h, real_w))
-    conf[shift_h:shift_h+h, shift_w:shift_w+w] = np.exp(conf1.detach().cpu().numpy())
-    conf = cv2.resize(conf, (sup_res_h, sup_res_w), interpolation=cv2.INTER_LINEAR)
-    tenMetric = torch.tensor(conf).unsqueeze(0).unsqueeze(0).cuda().float()
+    #conf = np.zeros((real_h, real_w))
+    #conf[shift_h:shift_h+h, shift_w:shift_w+w] = np.exp(conf1.detach().cpu().numpy())
+    #conf = cv2.resize(conf, (sup_res_h, sup_res_w), interpolation=cv2.INTER_LINEAR)
+    #tenMetric = torch.tensor(conf).unsqueeze(0).unsqueeze(0).cuda().float()
+    
+    tenMetric = torch.nn.functional.l1_loss(input=frame1, target=backwarp(tenIn=frame2, tenFlow=flow_end2end), reduction='none').mean([1], True)
 
-    out_soft = softsplat(tenIn=frame1, tenFlow=flow, tenMetric=(-10.0 * (np.exp(1.5)-tenMetric)).clip(-10.0, 10.0), strMode='soft')
+    out_soft = softsplat(tenIn=frame1, tenFlow=flow, tenMetric=(-10.0 * tenMetric).clip(-10.0, 10.0), strMode='soft')    
+    return out_soft
+
+def splat_flow(frame1, frame2, flow, time):
+    # frame1: tensor[1,c,h,w] cuda()
+    # frame2: tensor[1,c,h,w] cuda()
+    # flow  : tensor[h,w,2] cuda()
+    flow = flow.permute(2,0,1).unsqueeze(0).cuda()
+    tenMetric = torch.nn.functional.l1_loss(input=frame1, target=backwarp(tenIn=frame2, tenFlow=flow), reduction='none').mean([1], True)
+    out_soft = softsplat(tenIn=frame1, tenFlow=flow*time, tenMetric=(-10.0 * tenMetric).clip(-10.0, 10.0), strMode='soft')
     return out_soft
 
 def splat_flowmax(frame1, frame2, flow, time):
@@ -120,6 +158,26 @@ def splat_flowmax(frame1, frame2, flow, time):
     tenMetric = torch.nn.functional.l1_loss(input=frame1, target=backwarp(tenIn=frame2, tenFlow=flow), reduction='none').mean([1], True)
     # out_soft, mask = softsplat(tenIn=frame1, tenFlow=flow*time, tenMetric=(0.3 - tenMetric).clip(0.001, 1.0), strMode='max')
     return ((0.3-tenMetric).clip(0.001, 1.0))*time
+
+def get_flow_trans(flow1to2_f, flow2to1_f, flow1to2_o, flow2to1_o):
+    flow1to2_f = flow1to2_f.detach().cpu().numpy()
+    flow2to1_f = flow2to1_f.detach().cpu().numpy()
+    flow1to2_o = flow1to2_o.detach().cpu().numpy()
+    flow2to1_o = flow2to1_o.detach().cpu().numpy()
+
+    # stack IF1_x and IF1_y to create IF1 (H, 2*W)
+    IF1 = np.hstack([flow1to2_o[:, :, 0], flow1to2_o[:, :, 1]])
+    IF2 = np.hstack([flow2to1_o[:, :, 0], flow2to1_o[:, :, 1]])
+    F1 = np.hstack([flow1to2_f[:, :, 0], flow1to2_f[:, :, 1]])
+    F2 = np.hstack([flow2to1_f[:, :, 0], flow2to1_f[:, :, 1]])
+
+    IF = np.vstack([IF1, IF2])
+    F = np.vstack([F1, F2])
+
+    # IF @ flow_trans = F
+    flow_trans = np.linalg.solve(IF, F)
+
+    return flow_trans
 
 def predict_z0_opflow(model, args, sup_res_h, sup_res_w, pts3d, conf, guidance_3d=None, guidance_traj=None, mode = "baseline"):
     if args.guide_mode == "baseline":
@@ -147,7 +205,34 @@ def predict_z0_opflow(model, args, sup_res_h, sup_res_w, pts3d, conf, guidance_3
                                 guidance_scale=args.guidance_scale,
                                 num_inference_steps=args.n_inference_step,
                                 num_actual_inference_steps=args.n_actual_inference_step,
+                                # num_actual_inference_steps=args.feature_inversion,
                                 return_intermediates=True)
+
+        init_code = deepcopy(invert_code)
+        model.scheduler.set_timesteps(args.n_inference_step)
+        t = model.scheduler.timesteps[args.n_inference_step - args.feature_inversion]
+        text_emb = model.get_text_embeddings(args.prompt).detach()
+        unet_output, all_return_features = forward_unet_features(
+            init_code, 
+            t, 
+            encoder_hidden_states=text_emb.repeat(2,1,1),
+            guidance_3d=guidance_3d,
+            guidance_traj=guidance_traj,
+            layer_idx=args.unet_feature_idx
+            )
+        F0 = all_return_features[args.unet_feature_idx[0]]
+    
+        flow1to2_f = feature_flow(F0, forward = True, f_size=(sup_res_h, sup_res_w), save_path=os.path.join(args.save_dir, f"flow_feature01.png"))
+        flow2to1_f = feature_flow(F0, forward = False, f_size=(sup_res_h, sup_res_w), save_path=os.path.join(args.save_dir, f"flow_feature10.png"))
+
+        # invert_code, pred_x0_list = invert_function(args.source_image,
+        #                         args.prompt,
+        #                         guidance_3d=guidance_3d,
+        #                         guidance_traj=guidance_traj,
+        #                         guidance_scale=args.guidance_scale,
+        #                         num_inference_steps=args.n_inference_step,
+        #                         num_actual_inference_steps=args.n_actual_inference_step,
+        #                         return_intermediates=True)
         
         init_code = deepcopy(invert_code) # (2,4,64,64)
         pred_code = deepcopy(pred_x0_list[args.n_actual_inference_step]) # (2,4,64,64)
@@ -159,8 +244,13 @@ def predict_z0_opflow(model, args, sup_res_h, sup_res_w, pts3d, conf, guidance_3
         trajectory = get_trajectory(args.img_path, None)
         args.Time = len(trajectory)
 
-        flow1to2   = optical_flow(args.source_image, pts3d, extrinsics, intrinsics, forward = True, save_path=os.path.join(args.save_dir, "flow01.png"), f_size=(sup_res_h, sup_res_w))
-        flow2to1   = optical_flow(args.source_image, pts3d, extrinsics, intrinsics, forward = False, save_path=os.path.join(args.save_dir, "flow10.png"), f_size=(sup_res_h, sup_res_w))
+        if not os.path.exists(os.path.join(args.save_dir, "flows")):
+            os.makedirs(os.path.join(args.save_dir, "flows"), exist_ok=True)
+        
+        flow1to2_o = optical_flow(args.source_image, pts3d, extrinsics, intrinsics, forward = True, save_path=os.path.join(args.save_dir, "flow_optical01.png"), f_size=(sup_res_h, sup_res_w))
+        flow2to1_o = optical_flow(args.source_image, pts3d, extrinsics, intrinsics, forward = False, save_path=os.path.join(args.save_dir, "flow_optical10.png"), f_size=(sup_res_h, sup_res_w))
+
+        # flow_trans = get_flow_trans(flow1to2_f, flow2to1_f, flow1to2_o, flow2to1_o)
 
         pred_list = []
         cv2.imwrite(os.path.join(args.save_dir,'pred_0.png'), cv2.cvtColor(model.latent2image(pred_code[:1]), cv2.COLOR_BGR2RGB))
@@ -168,18 +258,23 @@ def predict_z0_opflow(model, args, sup_res_h, sup_res_w, pts3d, conf, guidance_3
 
         for i in range(1,args.Time): 
             time = i/args.Time
-            target_pose = torch.tensor(trajectory[i])
-            out_soft12 = splat_flow(args.source_image, input_code[:1], pts3d[0], conf[0], [extrinsics[0],target_pose], intrinsics, sup_res_h, sup_res_w)
-            out_soft21 = splat_flow(args.source_image, input_code[1:], pts3d[1], conf[1], [extrinsics[1],target_pose], intrinsics, sup_res_h, sup_res_w)
+            target_pose = torch.tensor(trajectory[i])                                               
+            out_soft12_o = splat_flow_opt(args.source_image, input_code[:1], input_code[1:], pts3d[0], conf[0], [extrinsics[0],target_pose], intrinsics, flow1to2_o, sup_res_h, sup_res_w, os.path.join(args.save_dir, "flows", f"{i}_01.png"))
+            out_soft21_o = splat_flow_opt(args.source_image, input_code[1:], input_code[:1], pts3d[1], conf[1], [extrinsics[1],target_pose], intrinsics, flow2to1_o, sup_res_h, sup_res_w, os.path.join(args.save_dir, "flows", f"{i}_10.png"))
+            out_soft12 = splat_flow(input_code[:1], input_code[1:], flow1to2_f, time)
+            out_soft21 = splat_flow(input_code[1:], input_code[:1], flow2to1_f, 1-time)
+            
             mask =  out_soft12[:,-1] * out_soft21[:,-1]
+            
             out_soft = \
                 ((1. - time) * out_soft12[0,:-1] + time * out_soft21[0,:-1]) * mask \
                 + out_soft21[0,:-1] * torch.clamp((out_soft21[:,-1]-mask),min=0) \
                 + out_soft12[0,:-1] * torch.clamp((out_soft12[:,-1]-mask),min=0) \
                 + ((1. - time) * input_code[0,:-1] + time * input_code[1,:-1]) * (1-torch.clamp((out_soft12[:,-1] + out_soft21[:,-1]),max=1))
+            # out_soft = out_soft12[0,:-1] * (1.-time) + out_soft21[0,:-1] * time
             pred_list.append(out_soft.unsqueeze(0))
             cv2.imwrite(os.path.join(args.save_dir,'pred_%d.png'  %i), cv2.cvtColor(model.latent2image(out_soft.unsqueeze(0)), cv2.COLOR_BGR2RGB))
         pred_list = torch.cat(pred_list,dim=0)
         
         torch.save(pred_list, os.path.join(args.save_dir,"pred_list.pt"))
-        return flow1to2, flow2to1
+        return flow1to2_f, flow2to1_f

@@ -6,7 +6,42 @@ import numpy as np
 import cv2
 from copy import deepcopy
 
-def feature_flow(ft, forward,f_size):
+def vis_flow(flow, save_path):
+    # flow: (H, W, 2)
+    h,w = flow.shape[:2]
+    flow_x = flow[:,:,0]
+    flow_y = flow[:,:,1]
+
+    # draw flow image with arrow
+    flow_img = np.zeros((h+200, w+200, 3), dtype=np.uint8)
+
+    for i in range(0, h, h//20):
+        for j in range(0, w, w//20):
+            cv2.arrowedLine(flow_img, (j+100, i+100), (j+100+int(flow_x[i,j])//(h//10), i+100+int(flow_y[i,j])//(w//10)), (255, 255, 255), 1)
+    cv2.imwrite(save_path.replace(".png", "_arrow.png"), flow_img)
+
+    # clip flow value with w, h
+    flow_x = np.clip(flow_x, -w, w)
+    flow_y = np.clip(flow_y, -h, h)
+
+    # change flow value to 0~255
+    flow_x = (flow_x + w) * 255 / (2*w)
+    flow_y = (flow_y + h) * 255 / (2*h)
+
+    # create flow image (x: blue, y: red)
+    flow_x = flow_x.astype(np.uint8)
+    flow_y = flow_y.astype(np.uint8)
+    
+    # save color image
+    flow_img = np.zeros((h, w, 3), dtype=np.uint8)
+    flow_img[:,:,0] = flow_x
+    cv2.imwrite(save_path.replace(".png", "_x.png"), cv2.cvtColor(flow_img, cv2.COLOR_BGR2RGB))
+
+    flow_img = np.zeros((h, w, 3), dtype=np.uint8)
+    flow_img[:,:,1] = flow_y
+    cv2.imwrite(save_path.replace(".png", "_y.png"), cv2.cvtColor(flow_img, cv2.COLOR_BGR2RGB))
+
+def feature_flow(ft, forward,f_size,save_path=None):
     if forward == False:
         ft = torch.flip(ft, dims=[0])
     trg_ft = nn.Upsample(size=(f_size[0], f_size[1]), mode='bilinear')(ft[1:])
@@ -24,6 +59,8 @@ def feature_flow(ft, forward,f_size):
             del src_ft
             del cos_map
             torch.cuda.empty_cache()
+    if save_path is not None:
+        vis_flow(flow, save_path)
     return flow
 
 def backwarp(tenIn, tenFlow):
@@ -79,7 +116,7 @@ def predict_z0(model, args, sup_res_h, sup_res_w, guidance_3d=None, guidance_tra
                                 guidance_traj=guidance_traj,
                                 guidance_scale=args.guidance_scale,
                                 num_inference_steps=args.n_inference_step,
-                                num_actual_inference_steps=args.n_actual_inference_step,
+                                num_actual_inference_steps=args.feature_inversion,
                                 return_intermediates=True)
 
         init_code = deepcopy(invert_code)
@@ -96,7 +133,7 @@ def predict_z0(model, args, sup_res_h, sup_res_w, guidance_3d=None, guidance_tra
             )
         F0 = all_return_features[args.unet_feature_idx[0]]
 
-        invert_code, pred_x0_list = model.invert(args.source_image,
+        invert_code, pred_x0_list = invert_function(args.source_image,
                                 args.prompt,
                                 guidance_3d=guidance_3d,
                                 guidance_traj=guidance_traj,
@@ -110,8 +147,8 @@ def predict_z0(model, args, sup_res_h, sup_res_w, guidance_3d=None, guidance_tra
         
         src_mask = torch.ones(2, 1, init_code.shape[2], init_code.shape[3]).cuda()
         input_code = torch.cat([pred_code, src_mask], 1)
-        flow1to2   = feature_flow(F0, forward = True, f_size=(sup_res_h, sup_res_w)) 
-        flow2to1   = feature_flow(F0, forward = False, f_size=(sup_res_h, sup_res_w))
+        flow1to2   = feature_flow(F0, forward = True, f_size=(sup_res_h, sup_res_w), save_path=os.path.join(args.save_dir, "flow01.png"))
+        flow2to1   = feature_flow(F0, forward = False, f_size=(sup_res_h, sup_res_w), save_path=os.path.join(args.save_dir, "flow10.png"))
         pred_list = []
         cv2.imwrite(os.path.join(args.save_dir,'pred_0.png'), cv2.cvtColor(model.latent2image(pred_code[:1]), cv2.COLOR_BGR2RGB))
         cv2.imwrite(os.path.join(args.save_dir,'pred_%d.png' %args.Time), cv2.cvtColor(model.latent2image(pred_code[-1:]), cv2.COLOR_BGR2RGB))

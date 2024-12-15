@@ -38,20 +38,22 @@ def get_extrinsics_intrinsics(img_dir):
     extrinsics_path = os.path.join(img_dir, 'extrinsics.json')
     intrinsics_path = os.path.join(img_dir, 'intrinsics.json')
     
-    if os.path.exists(extrinsics_path):
-        with open(extrinsics_path, 'r') as f:
-            data_extrinsics = json.load(f)
+    if not os.path.exists(extrinsics_path) or not os.path.exists(intrinsics_path):
+        recon_3d_mast3r(img_dir, None, None)
 
-        extrinsics = torch.tensor(data_extrinsics['extrinsics']).float() # (2, 4, 4)
+    with open(extrinsics_path, 'r') as f:
+        data_extrinsics = json.load(f)
 
-    if os.path.exists(intrinsics_path):
-        with open(intrinsics_path, 'r') as f:
-            data_intrinsics = json.load(f)
+    extrinsics = torch.tensor(data_extrinsics['extrinsics']).float() # (2, 4, 4)
 
-        intrinsics = {
-            "focals": data_intrinsics['focals'], # len 2 list
-            "principal_points": torch.tensor(data_intrinsics['principal_points']).float() # (2, 2)
-        }    
+    
+    with open(intrinsics_path, 'r') as f:
+        data_intrinsics = json.load(f)
+
+    intrinsics = {
+        "focals": data_intrinsics['focals'], # len 2 list
+        "principal_points": torch.tensor(data_intrinsics['principal_points']).float() # (2, 2)
+    }    
 
     return extrinsics, intrinsics
 
@@ -86,6 +88,7 @@ def get_trajectory(img_dir, poses, length = 20):
 
 def get_guidance_input(img_path, use_mast3r=True):
     extrinsics, intrinsics = get_extrinsics_intrinsics(img_path)
+
     if use_mast3r:
         _, _, poses, _, pts3d, _, confidence_masks, _, _ = recon_3d_mast3r(img_path, extrinsics, intrinsics)
     else:
