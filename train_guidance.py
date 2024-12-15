@@ -212,10 +212,10 @@ def main(args):
 
     if args.guide_mode == 'guide_concat':
         out_dim = 768
-        if args.spatial_guidance_model_load_path is not None and not args.spatial_guidance_model_load_path.endswith("_768.pth"):
-            args.spatial_guidance_model_load_path = args.spatial_guidance_model_load_path.replace(".pth", "_768.pth")
-        if args.trajectory_guidance_model_load_path is not None and not args.trajectory_guidance_model_load_path.endswith("_768.pth"):
-            args.trajectory_guidance_model_load_path = args.trajectory_guidance_model_load_path.replace(".pth", "_768.pth")
+        # if args.spatial_guidance_model_load_path is not None and not args.spatial_guidance_model_load_path.endswith("_768.pth"):
+        #     args.spatial_guidance_model_load_path = args.spatial_guidance_model_load_path.replace(".pth", "_768.pth")
+        # if args.trajectory_guidance_model_load_path is not None and not args.trajectory_guidance_model_load_path.endswith("_768.pth"):
+        #     args.trajectory_guidance_model_load_path = args.trajectory_guidance_model_load_path.replace(".pth", "_768.pth")
     
     if args.spatial_guidance_model_load_path is None:
         spatial_guidance_model = SpatialGuidanceModel(output_dim=out_dim)
@@ -294,7 +294,7 @@ def main(args):
     )
     
     start_extra_epoch = 0
-    start_extra_step = 10000
+    start_extra_step = 0
     use_extra_prob = 0.4
    
     for epoch in range(args.num_train_epochs):
@@ -305,7 +305,7 @@ def main(args):
         if args.train_trajectory_guidance:
             trajectory_guidance_model.train()
         
-        progress_bar = tqdm(range(0, max_train_steps))
+        progress_bar = tqdm(range(0, len(train_dataloader)))
         progress_bar.set_description("Steps")
         global_step = 0
         

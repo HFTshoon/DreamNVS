@@ -49,11 +49,11 @@ def main(args):
 
     # set guidance model
     print("loading guidance models")
-    if args.guide_mode == "guide_concat":
-        if not args.spatial_guidance_path.endswith("_768.pth"):
-            args.spatial_guidance_path = args.spatial_guidance_path.replace(".pth", "_768.pth")
-        if not args.trajectory_guidance_path.endswith("_768.pth"):
-            args.trajectory_guidance_path = args.trajectory_guidance_path.replace(".pth", "_768.pth")
+    # if args.guide_mode == "guide_concat":
+    #     if not args.spatial_guidance_path.endswith("_768.pth"):
+    #         args.spatial_guidance_path = args.spatial_guidance_path.replace(".pth", "_768.pth")
+    #     if not args.trajectory_guidance_path.endswith("_768.pth"):
+    #         args.trajectory_guidance_path = args.trajectory_guidance_path.replace(".pth", "_768.pth")
     model.spatial_guidance_model = load_spatial_guidance_model(args.spatial_guidance_path).to(device)
     model.trajectory_guidance_model = load_trajectory_guidance_model(args.trajectory_guidance_path).to(device)
     model.spatial_guidance_model.load_lora(args.spatial_guidance_lora_path)
@@ -107,12 +107,14 @@ def main(args):
                                         start_layer=10,
                                         total_steps=args.n_inference_step,
                                         guidance_scale=args.guidance_scale)
+
+
+        # apply inter frames attention 
         # if args.lora_path == "":
         #    register_attention_editor_diffusers(model, editor, attn_processor='attn_proc')
         # else:
         #    register_attention_editor_diffusers(model, editor, attn_processor='lora_attn_proc')
 
-        # apply inter frames attention 
         # setattr(editor, 'flag', True)
             
         input_latents = []
@@ -168,9 +170,9 @@ if __name__ == '__main__':
     parser.add_argument('--trajectory_guidance_lora_path', type=str, help='guidance model directory', required=True)
     parser.add_argument('--save_dir', type=str, help='save results directory', required=False, default="./results")
     parser.add_argument('--guide_mode', type=str, help='model mode', default='guide_concat')
-    parser.add_argument('--guidance_scale', type=float, help='CFG', default=2.0)
-    parser.add_argument('--guidance_scale_3d', type=float, help='CFG', default=2.0)
-    parser.add_argument('--guidance_scale_traj', type=float, help='CFG', default=2.0)
+    parser.add_argument('--guidance_scale', type=float, help='CFG', default=1.0)
+    parser.add_argument('--guidance_scale_3d', type=float, help='CFG', default=1.0)
+    parser.add_argument('--guidance_scale_traj', type=float, help='CFG', default=1.0)
     parser.add_argument('--n_inference_step', type=int, help='total noisy timestamp', default=50)
     parser.add_argument('--feature_inversion', type=int, help='DDIM Inversion steps for feature maps', default=14)
     parser.add_argument('--n_actual_inference_step', type=int, help='DDIM Inversion steps for inference', default=30)
@@ -180,8 +182,14 @@ if __name__ == '__main__':
     
 
     args = parser.parse_args()
+    
+    img_list = []
+    for file_name in os.listdir(args.img_path):
+        if file_name.endswith(".png") or file_name.endswith(".jpg"):
+            img_list.append(file_name)
+    img_list.sort()
+    img_pathlist = [os.path.join(args.img_path,img_name) for img_name in img_list]
 
-    img_pathlist = [os.path.join(args.img_path,'0.png'),os.path.join(args.img_path,'1.png')]
     img = []
     for img_path in img_pathlist:
         img.append(imageio.imread(img_path))

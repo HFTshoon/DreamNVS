@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import numpy as np
 
@@ -24,7 +25,13 @@ def recon_3d_mast3r(img_dir, extrinsics=None, intrinsics=None):
     # you can put the path to a local checkpoint in model_name if needed
     model = AsymmetricMASt3R.from_pretrained(model_path).to(device)
     
-    img_path_list = [os.path.join(img_dir,'0.png'),os.path.join(img_dir,'1.png')]
+    img_list = []
+    for file_name in os.listdir(img_dir):
+        if file_name.endswith(".png") or file_name.endswith(".jpg"):
+            img_list.append(file_name)
+    img_list.sort()
+    img_path_list = [os.path.join(img_dir,img_name) for img_name in img_list]
+    print(img_path_list)
     images = load_images(img_path_list, size=512)
     output = inference([tuple(images)], model, device, batch_size=1)
 
@@ -74,6 +81,23 @@ def recon_3d_mast3r(img_dir, extrinsics=None, intrinsics=None):
 
     valid_matches = valid_matches_im0 & valid_matches_im1
     matches_im0, matches_im1 = matches_im0[valid_matches], matches_im1[valid_matches]
+
+    if extrinsics is None:
+        extrinsics_path = os.path.join(img_dir, 'extrinsics.json')
+        extrinsics = {
+            "extrinsics": poses.detach().cpu().numpy().tolist()
+        }
+        with open(extrinsics_path, 'w') as f:
+            json.dump(extrinsics, f)
+
+    if intrinsics is None:
+        intrinsics_path = os.path.join(img_dir, 'intrinsics.json')
+        intrinsics = {
+            "focals": [focal[0] for focal in focals.detach().cpu().numpy().tolist()],
+            "principal_points": pps.detach().cpu().numpy().tolist()
+        }
+        with open(intrinsics_path, 'w') as f:
+            json.dump(intrinsics, f)
 
     return imgs, focals, poses, pps, pts3d, conf, confidence_masks, matches_im0, matches_im1
 

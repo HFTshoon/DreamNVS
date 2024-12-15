@@ -828,11 +828,11 @@ def main(args):
     else:
         vae = AutoencoderKL.from_pretrained(args.vae_path)
 
-    if args.guide_mode == "guide_concat":
-        if args.spatial_guidance_path != "default" and not args.spatial_guidance_path.endswith("_768.pth"):
-            args.spatial_guidance_path = args.spatial_guidance_path.replace(".pth", "_768.pth")
-        if args.trajectory_guidance_path != "default" and not args.trajectory_guidance_path.endswith("_768.pth"):
-            args.trajectory_guidance_path = args.trajectory_guidance_path.replace(".pth", "_768.pth")
+    # if args.guide_mode == "guide_concat":
+    #     if args.spatial_guidance_path != "default" and not args.spatial_guidance_path.endswith("_768.pth"):
+    #         args.spatial_guidance_path = args.spatial_guidance_path.replace(".pth", "_768.pth")
+    #     if args.trajectory_guidance_path != "default" and not args.trajectory_guidance_path.endswith("_768.pth"):
+    #         args.trajectory_guidance_path = args.trajectory_guidance_path.replace(".pth", "_768.pth")
 
     if args.spatial_guidance_path != "default":
         spatial_guidance_model = load_spatial_guidance_model(args.spatial_guidance_path)
@@ -1543,10 +1543,10 @@ def main(args):
 
         if spatial_guidance_model is not None:
             if args.train_spatial_encoder:
-                spatial_guidance_model.save_lora("./guidance/spatial_guidance_model_dreambooth_lora.pth")
+                spatial_guidance_model.save_lora(os.path.join(args.output_dir, "spatial_guidance_model_dreambooth_lora.pth"))
         if trajectory_guidance_model is not None:
             if args.train_trajectory_encoder:
-                trajectory_guidance_model.save_lora("./guidance/trajectory_guidance_model_dreambooth_lora.pth")
+                trajectory_guidance_model.save_lora(os.path.join(args.output_dir, "trajectory_guidance_model_dreambooth_lora.pth"))
 
     accelerator.end_training()
 
